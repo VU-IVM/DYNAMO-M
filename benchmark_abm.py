@@ -1,6 +1,7 @@
 ''' Calibration  of the COASTMOVE ABM.
-We calibrate the risk perception of households on observed adaptation uptake in France.
-We calibrate the gravity model of migration between inland nodes and towards coastal nodes on observed migration flows'''
+We calibrate the risk perception of households on observed adaptation uptake in France. This script performs a grid search within the parameter space identified in literature.
+The dataframes produced here are used in further analysis.
+'''
 
 import os
 import numpy as np
@@ -156,7 +157,7 @@ def RunModel(targets):
                                 adapted_agents_all = np.append(adapted_agents_all, adapted_agent)
                             
                             score_0 = np.sum((adapted_all_regions - target) **2, dtype=np.float32)  # Squared residuals 
-                            score_1 = np.mean(adapted_agents_all, dtype=np.float32) * 100
+                            score_1 = np.mean(adapted_agents_all, dtype=np.float32) * 100 # Store percentage of all agents having implemented dry flood proofing.
 
                             calibration_results_rsqrt_runs[duplicate] = score_0
                             calibration_results_runs[duplicate] = score_1

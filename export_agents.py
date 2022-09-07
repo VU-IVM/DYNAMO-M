@@ -1,3 +1,5 @@
+'''This script contains functions to export agent level data if selected in settings.yml'''
+
 import numpy as np
 import geopandas as gpd
 from numpy.core.fromnumeric import size

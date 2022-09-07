@@ -1,3 +1,4 @@
+'''This script is applied to run the model'''
 import os
 import numpy as np
 import pandas as pd

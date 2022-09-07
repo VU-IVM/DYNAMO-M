@@ -1,3 +1,5 @@
+'''In this script all coastal and inland node properties are stored'''
+
 import numpy as np
 
 class NodeProperties:

@@ -1,3 +1,6 @@
+'''This script is used to generate the agent population using gridded population data. It must be run to create the 
+geofiles required to run the model.'''
+
 import geopandas as gpd
 from osgeo import gdal, ogr
 # from hyve.library.raster import rasterize

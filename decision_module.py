@@ -1,13 +1,8 @@
-from dataclasses import dataclass
-from functools import cache
-from joblib import Parallel
+'''In this script the migration and adaptation rules are coded. We use a combination of numpy and numba operations to speed up the model run time'''
+
 from numba.core.decorators import njit
 import numpy as np
 import yaml
-
-
-# def EU_stay(decision_params):
-#     return EU_do_nothing(**decision_params), EU_adapt(**decision_params)
 
 @njit(cache=True)
 def IterateThroughFlood(n_floods, wealth, income, amenity_value, max_T, expected_damages, n_agents, r):

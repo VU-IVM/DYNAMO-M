@@ -1,3 +1,7 @@
+'''In this script the agents within the coastal nodes and the aggregated households in the inland nodes are defined.
+It contains the methods to update flood hazard, to process the household decisions, and to process migration flows.'''
+
+
 import numpy as np
 from numba import njit
 import numba as nb

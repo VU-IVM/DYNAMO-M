@@ -1,11 +1,5 @@
-# In this module stochastic flood events are simulated.
+''' This script contains the function used to generate stochastic flood events'''
 import numpy as np 
-import rasterio
-import rasterio.mask
-import fiona
-import os
-from scipy import interpolate
-import pandas as pd
 
 def stochastic_flood(water_levels, return_periods,
  flooded, flood_count, risk_perceptions,

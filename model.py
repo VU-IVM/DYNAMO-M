@@ -1,3 +1,5 @@
+'''This script is used to define the model class based on parent classes defined in the honeybees package'''
+
 from dateutil.relativedelta import relativedelta
 from honeybees.library.helpers import timeprint
 from time import time

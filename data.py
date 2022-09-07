@@ -1,11 +1,12 @@
+'''In this script all data are loaded into the data class. 
+We do not include the actual data in this repository, since it can be downloaded though official sources stated in the publication.'''
+
 import pandas as pd
 import os
 import numpy as np
 from dateutil.relativedelta import relativedelta
 from honeybees.library.mapIO import NetCDFReader, ArrayReader
 from honeybees.library.raster import write_to_array
-
-# TO DO -> MOVE ALL VARIABLES TO DICTIONARY (ITERATE OVER KEYS TO LOAD)
 
 class Data():
     def __init__(self, model):
