@@ -1,0 +1,12 @@
+gravity_model_pop_inc_dist_coast2:
+  intercept: -0.25545259723738334
+  population_i: 1.2690876765896968 
+  population_j: 0.35316965396996364 
+  income_i: -6.031648887562087
+  income_j: 4.48325441430637 
+  coastal_i:  -0.9794964474132777
+  coastal_j: 0.7428097398894689 
+  distance: -0.30678096595511467 
+  social_connectiveness: 0
+  employment: 0
+
