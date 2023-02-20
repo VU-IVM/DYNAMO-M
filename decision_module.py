@@ -1,15 +1,37 @@
-'''In this script the migration and adaptation rules are coded. We use a combination of numpy and numba operations to speed up the model run time'''
-
 from numba.core.decorators import njit
 import numpy as np
-import yaml
+from gravity_models.read_gravity_model import read_gravity_model
+import os 
+from scipy import interpolate
 
 @njit(cache=True)
-def IterateThroughFlood(n_floods, wealth, income, amenity_value, max_T, expected_damages, n_agents, r):
- 
+def IterateThroughFlood(
+    n_floods: int,
+    wealth: np.ndarray,
+    income: np.ndarray, 
+    amenity_value: np.ndarray,
+    max_T: int, 
+    expected_damages: np.ndarray, 
+    n_agents: int, 
+    r: float
+    ) -> np.ndarray:
+    '''This function iterates through each (no)flood event i (see manuscript for details). It calculates the time discounted NPV of each event i:
+    
+    Args:
+        n_floods: number of flood maps included in model run
+        wealth: array containing the wealth of each household
+        income: array containing the income of each household
+        amenity_value: array containing the amenity value of each household'
+        max_T: time horizon (same for each agent)
+        expected_damages: array containing the expected damages of each household under all events i
+        n_agents: number of household agents in the current admin unit
+        r: time discounting rate
+    
+    Returns:
+        NPV_summed: Array containing the summed time discounted NPV for each event i for each agent'''
+
     # Allocate array
     NPV_summed = np.full((n_floods+3, n_agents), -1, dtype=np.float32)
-
 
     # Iterate through all floods 
     for i, index in enumerate(np.arange(1, n_floods+3)):
@@ -26,10 +48,12 @@ def IterateThroughFlood(n_floods, wealth, income, amenity_value, max_T, expected
 
         # iterate over NPVs for each year in the time horizon and apply time discounting
         NPV_t0 = (wealth + income + amenity_value).astype(np.float32) # no flooding in t=0
-        NPV_tx = np.full(NPV_t0.size, -1, dtype=np.float32) # Array
 
-        for t in np.arange(1, max_T):
-            NPV_tx += NPV_flood_i/ (1 + r)**t
+        # Calculate time discounted NPVs
+        t_arr = np.arange(1, max_T, dtype=np.float32)
+        discounts = 1/(1+r)**t_arr
+        NPV_tx = np.sum(discounts) * NPV_flood_i
+
 
         # Add NPV at t0 (which is not discounted)
         NPV_tx += NPV_t0
@@ -37,24 +61,47 @@ def IterateThroughFlood(n_floods, wealth, income, amenity_value, max_T, expected
         # Store result
         NPV_summed[index] = NPV_tx
 
-    # Store NPV at p=0 for bounds in integration 
+    # Store NPV at p=0 for bounds in integration
     NPV_summed[0] = NPV_summed[1]   
 
     return NPV_summed
 
 def calcEU_no_nothing(
-    n_agents,
-    wealth,
-    income,
-    amenity_value,
-    risk_perception,
-    expected_damages,
-    adapted,
-    p_floods,
-    T,
-    r,
-    sigma,
-    **kwargs): 
+    n_agents: int,
+    wealth: np.ndarray,
+    income: np.ndarray,
+    amenity_value: np.ndarray,
+    amenity_weight,
+    risk_perception: np.ndarray,
+    expected_damages: np.ndarray,
+    adapted: np.ndarray,
+    p_floods: np.ndarray,
+    T: np.ndarray,
+    r: float,
+    sigma: float,
+    **kwargs
+    ) -> np.ndarray:
+
+    '''This function calculates the time discounted subjective utility of not undertaking any action. 
+    
+    Args:
+        n_agents: number of agents in the floodplain.
+        wealth: array containing the wealth of each household. 
+        income: array containing the income of each household. 
+        amenity_value: array containing the aminity value of each household.
+        risk_perception: array containing the risk perception of each household (see manuscript for details).
+        expected_damages: array expected damages for each flood event for each agent under no implementation of dry flood proofing.
+        adapted: array containing the adaptation status of each agent (1 = adapted, 0 = not adapted).
+        p_floods: array containing the exceedance probabilities of each flood event included in the analysis.
+        T: array containing the decision horizon of each agent.
+        r: time discounting factor.
+        sigma: risk aversion setting. 
+    
+    Returns:
+        EU_do_nothing_array: array containing the time discounted subjective utility of doing nothing for each agent. 
+    ''' 
+    # weigh amenities
+    amenity_value = amenity_value * amenity_weight
 
      
     # Ensure p floods is in increasing order
@@ -111,27 +158,54 @@ def calcEU_no_nothing(
 
 @njit(cache=True)
 def calcEU_adapt(
-    expendature_cap,
-    loan_duration,
-    n_agents,
-    sigma,
-    wealth,
-    income,
-    amenity_value,
-    p_floods,
-    risk_perception,
-    expected_damages_adapt,
-    adaptation_costs,
-    time_adapted,
-    adapted,
-    T,
-    r,
+    expendature_cap: float,
+    loan_duration: int,
+    n_agents: int,
+    sigma: float,
+    wealth: np.ndarray,
+    income: np.ndarray,
+    amenity_value: np.ndarray,
+    amenity_weight,
+    p_floods: np.ndarray,
+    risk_perception: np.ndarray,
+    expected_damages_adapt: np.ndarray,
+    adaptation_costs: np.ndarray,
+    time_adapted: np.ndarray,
+    adapted: np.ndarray,
+    T: np.ndarray,
+    r: float,
 
     # Not used (kwargs not supported in njit)
     lifespan_dryproof,
     expected_damages
-    ):
+    ) -> np.ndarray:
     
+    '''This function calculates the discounted subjective utility for staying and implementing dry flood proofing measures for each agent. 
+    We take into account the current adaptation status of each agent, so that agents also consider the number of years of remaining loan payment. 
+    
+    Args: 
+        expendature_cap: expenditure cap for dry flood proofing investments.
+        loan_duration: loan duration of the dry flood proofing investment.
+        n_agents: number of agents present in the current floodplain. 
+        sigma: risk aversion setting of the agents.
+        wealth: array containing the wealth of each household.
+        income: array containing the income of each household.
+        amenity_value: array contining the amenity value experienced by each household.
+        p_floods: array containing the exceedance probabilities of each flood event included in the analysis.
+        risk_perception: array containing the risk perception of each household.
+        expected_damages_adapt: array of expected damages for each flood event for each agent under dry flood proofing measures.
+        adaptation_costs: = array of annual implementation costs for dry flood proofing for each household.  
+        time_adapted: array containing the time each agent has been paying off their dry flood proofing investment loan.
+        adapted: array containing the adaptation status of each agent (1 = adapted, 0 = not adapted).
+        T: array containing the decision horizon of each agent.
+        r: time discounting factor.
+
+    Returns:
+       EU_adapt: array containing the time discounted subjective utility of staying and implementing dry flood proofing for each agent. 
+    '''
+    # Adjust amenity values
+    amenity_value = amenity_value * amenity_weight
+
     # Preallocate arrays
     EU_adapt =  np.full(n_agents, -1,  dtype=np.float32)
     EU_adapt_dict =  np.zeros(len(p_floods) + 3, dtype=np.float32)
@@ -212,27 +286,81 @@ def calcEU_adapt(
 
 # Cost function
 @njit(cache=True)
-def LogisticFunction(Cmax, k, x):
+def LogisticFunction(
+    Cmax: np.ndarray, 
+    k: float, 
+    x: float):
+    ''''Function used to calculate the costs of migration to each node.
+    
+    Args:
+        Cmax: maximum migration costs at distance = inf. 0.5 * Cmax represents costs at distance = 0.
+        k: shape of the cost curve.
+        x: distance to the other node.
+        
+    Returns:
+        y: costs of migration to the respective node.'''
+
+    
+
     y = Cmax/ (1+np.exp(-k * x))
     return y
 
 
-
 # njit not faster here, maybe include when considering more destinations
-def fill_regions(regions_select, income_distribution_regions, income_percentile, expected_income_agents):
+def fill_regions(
+    regions_select: np.ndarray, 
+    income_distribution_regions: np.ndarray, 
+    amenity_value_regions,
+    amenity_weight,
+    income_percentile: np.ndarray, 
+    expected_income_agents: np.ndarray,
+    expected_wealth_agents,
+    expected_amenity_value_agents):
+
+    perc = np.array([0, 20, 40, 60, 80, 100])
+    ratio = np.array([0, 1.06, 4.14, 4.19, 5.24, 6])
+    income_wealth_ratio = interpolate.interp1d(perc, ratio)     
+
+
     for i, region in enumerate(regions_select):
         
         # Sort income
         sorted_income = np.sort(income_distribution_regions[region])
         
-        # Derive indices from percentiles
-        income_indices = np.floor(income_percentile * 0.01 * len(sorted_income)).astype(np.int32)
+        # sort amenity values
+        if type(amenity_value_regions[region]) != int:
+            sorted_amenity_value = np.sort(amenity_value_regions[region])
+            amenity_indices = np.floor(income_percentile * 0.01 * len(sorted_amenity_value)).astype(np.int32)
+            expected_amenity_value_agents[i] = sorted_amenity_value[amenity_indices] * amenity_weight
+
+        else:
+            expected_amenity_value_agents[i] = amenity_value_regions[region]
         
+        # Derive indices from percentiless
+        income_indices = np.floor(income_percentile * 0.01 * len(sorted_income)).astype(np.int32)
+
         # Extract based on indices
         expected_income_agents[i] = sorted_income[income_indices]
+        
+        # Based on income calculate expected wealth
+        expected_wealth_agents[i] = income_wealth_ratio(income_percentile) * expected_income_agents[i]
+        
+        assert min(expected_wealth_agents[i]) > 0
 
 @njit(cache=True)
-def fill_NPVs(regions_select, wealth, expected_income_agents, amenity_value_regions, n_agents, distance, max_T, r, t_arr, sigma, Cmax, cost_shape):    
+def fill_NPVs(
+    regions_select: np.ndarray, 
+    expected_wealth_agents: np.ndarray, 
+    expected_income_agents: np.ndarray, 
+    expected_amenity_value_agents: np.ndarray, 
+    n_agents: int, 
+    distance: np.ndarray, 
+    max_T: int, 
+    r: float, 
+    t_arr: np.ndarray, 
+    sigma: float, 
+    Cmax: int, 
+    cost_shape: float):    
     
     # Preallocate arrays
     NPV_summed = np.full((regions_select.size, n_agents), -1, dtype=np.float32)
@@ -241,18 +369,15 @@ def fill_NPVs(regions_select, wealth, expected_income_agents, amenity_value_regi
     for i, region in enumerate(regions_select):
         
         # Add wealth and expected incomes. Fill values for each year t in max_T
-        NPV_t0 = (wealth + expected_income_agents[i, :] + amenity_value_regions[region]).astype(np.float32)
+        NPV_t0 = (expected_wealth_agents[i, :] + expected_income_agents[i, :] + expected_amenity_value_agents[i, :]).astype(np.float32)
         
-        # Apply and sum time discounting
-        NPV_region_discounted = np.zeros(NPV_t0.size, dtype=np.float32)
+        # # Apply and sum time discounting
+        t_arr = np.arange(max_T, dtype=np.float32)
+        discounts = 1/(1+r)**t_arr
+        NPV_region_discounted = np.sum(discounts) * NPV_t0
 
-        # Iterate and sum
-        for t in range(max_T):
-            t = float(t)
-            NPV_region_discounted += NPV_t0/(1+r)**t
-
-        # Subtract migration costs (these are not time discounted, occur at t=0) 
-        NPV_region_discounted -= LogisticFunction(Cmax=Cmax, k=cost_shape, x=distance[region])
+        # Subtract migration costs (these are not time discounted, occur at t=0) s
+        NPV_region_discounted = np.maximum(NPV_region_discounted - LogisticFunction(Cmax=Cmax, k=cost_shape, x=distance[region]), 1)
 
         # Store time discounted values
         NPV_summed[i, :] =  NPV_region_discounted
@@ -265,38 +390,38 @@ def fill_NPVs(regions_select, wealth, expected_income_agents, amenity_value_regi
     return EU_regions
 
 def EU_migrate(
-    regions_select,
-    n_agents,
-    sigma,
-    wealth,
-    income_distribution_regions,
-    income_percentile, 
-    amenity_value_regions,
-    distance,
-    Cmax,
-    cost_shape,
-    T,
-    r):
+    regions_select: np.ndarray,
+    n_agents: int,
+    sigma: float,
+    wealth: np.ndarray,
+    income_distribution_regions: np.ndarray,
+    income_percentile: np.ndarray, 
+    amenity_value_regions: np.ndarray,
+    amenity_weight,
+    distance: np.ndarray,
+    Cmax: int,
+    cost_shape: float,
+    T: np.ndarray,
+    r: float):
     
     '''This function calculates the subjective expected utilty of migration and the region for which 
     utility is highers. The function loops through each agent, processing their individual characteristics.
     
     Args:
-        region_id: ID of the current region
-        n_agents (int): The number of agents to loop through.
-        sigma (float): Array containing the risk aversion of each agent.
-        wealth (float): Array containing the wealth of each agent.
-        income_region (float): Array containing the mean income in each region.
-        income_percentile (int): Array Array containing the income percentile of each agent. This percentile indicates their position in the lognormal income distribution.
-        amenity_value_regions (float): Array containing the amenity value of each region. 
-        travel_cost (float): Array containing the travel costs to each region. The travel costs are assumed to be te same for each agent residing in the same region. 
-        fixed_migration_costs: Array containing the fixed migration costs for each agent. 
-        T (int): Array containing the decision horizon of each agent.
-        r (float): Array containing the time preference of each agent.
+        n_agents: the number of agents to loop through.
+        sigma: risk aversion setting of the agents.
+        wealth: array containing the wealth of each agent.
+        income_region: array containing the mean income in each region.
+        income_percentile: array Array containing the income percentile of each agent. This percentile indicates their position in the lognormal income distribution.
+        amenity_value_regions: array containing the amenity value of each region. 
+        travel_cost: array containing the travel costs to each region. The travel costs are assumed to be te same for each agent residing in the same region. 
+        fixed_migration_costs: array containing the fixed migration costs for each agent. 
+        T: array containing the decision horizon of each agent.
+        r: array containing the time preference of each agent.
     
     Returns:
-        EU_migr_MAX (float): Array containing the maximum expected utility of migration of each agent.
-        ID_migr_MAX (float): Array containing the region IDs for which the utility of migration is highest for each agent. 
+        EU_migr_MAX: array containing the maximum expected utility of migration of each agent.
+        ID_migr_MAX: array containing the region IDs for which the utility of migration is highest for each agent. 
 
     '''
     # Preallocate arrays
@@ -312,9 +437,33 @@ def EU_migrate(
 
     # Fill array with expected income based on position in income distribution    
     expected_income_agents = np.full((regions_select.size, income_percentile.size), -1, dtype=np.float32)
+    expected_amenity_value_agents = np.full((regions_select.size, income_percentile.size), -1, dtype=np.float32)
+    expected_wealth_agents =  np.full((regions_select.size, income_percentile.size), -1, dtype=np.float32)
 
-    fill_regions(regions_select, income_distribution_regions, income_percentile, expected_income_agents)    
-    EU_regions = fill_NPVs(regions_select, wealth, expected_income_agents, amenity_value_regions, n_agents, distance, max_T, r, t_arr, sigma, Cmax, cost_shape)
+    fill_regions(
+        regions_select = regions_select,
+        amenity_value_regions=amenity_value_regions,
+        income_distribution_regions=income_distribution_regions,
+        income_percentile=income_percentile,
+        amenity_weight = amenity_weight,
+        expected_amenity_value_agents=expected_amenity_value_agents,
+        expected_income_agents=expected_income_agents,
+        expected_wealth_agents=expected_wealth_agents
+    )      
+       
+    EU_regions = fill_NPVs(
+        regions_select = regions_select,
+        expected_wealth_agents = expected_wealth_agents,
+        expected_income_agents = expected_income_agents, 
+        expected_amenity_value_agents = expected_amenity_value_agents, 
+        n_agents = n_agents, 
+        distance = distance, 
+        max_T = max_T, 
+        r = r, 
+        t_arr = t_arr, 
+        sigma = sigma, 
+        Cmax = Cmax, 
+        cost_shape = cost_shape)
     
     EU_migr_MAX = EU_regions.max(axis=0)
     region_indices = EU_regions.argmax(axis=0)
@@ -324,17 +473,16 @@ def EU_migrate(
     
     return EU_migr_MAX, ID_migr_MAX
 
-admin_level = 2
-# Load yml with parameter settings
-with open(f'gravity_module_gadm_{admin_level}.yml') as f:
-    gravity_settings = yaml.load(f, Loader=yaml.FullLoader)
 
-model = 'gravity_model_pop_inc_dist_coast2'
 
+gravity_settings = read_gravity_model(admin_level = 2)
+model = 'gravity_model_OLS'
 
 constant = gravity_settings[model]['intercept']
 B_pop_i = gravity_settings[model]['population_i']
 B_pop_j = gravity_settings[model]['population_j']
+B_age_i = gravity_settings[model]['age_i']
+B_age_j = gravity_settings[model]['age_j']
 B_inc_i = gravity_settings[model]['income_i']
 B_inc_j = gravity_settings[model]['income_j']
 B_distance = gravity_settings[model]['distance']
@@ -343,23 +491,45 @@ B_coastal_j = gravity_settings[model]['coastal_j']
 
 
 
-def gravity_model(pop_i=None, pop_j=None,
-                     inc_i=None, inc_j=None,
-                     coastal_i=None, coastal_j=None, 
-                     distance=None,
-                     B_pop_i=B_pop_i,
-                     B_pop_j=B_pop_j, B_inc_i=B_inc_i,
-                     B_inc_j=B_inc_j, B_coastal_i=B_coastal_i, B_coastal_j=B_coastal_j,
-                     B_distance=B_distance, constant=constant):			
+def gravity_model(
+    pop_i=None,
+    pop_j=None,
+    inc_i=None, 
+    inc_j=None, 
+    age_i=None,
+    age_j=None,
+    coastal_i=None, 
+    coastal_j=None, 
+    distance=None,
+    origin_effect=None,
+    destination_effect=None,
+    B_pop_i=B_pop_i,
+    B_pop_j=B_pop_j,
+    B_age_i=B_age_i,
+    B_age_j=B_age_j,
+    B_inc_i=B_inc_i,
+    B_inc_j=B_inc_j, 
+    B_coastal_i=B_coastal_i, 
+    B_coastal_j=B_coastal_j,
+    B_distance=B_distance, 
+    constant=constant):			
 
-    flow = np.exp(
-        B_pop_i * np.log(pop_i) + 
-        B_pop_j * np.log(pop_j) + 
-        B_inc_i * np.log(inc_i) +
-        B_inc_j * np.log(inc_j) +       
-        B_coastal_i * coastal_i + 
-        B_coastal_j * coastal_j  +
-        B_distance * np.log(distance) +
-        constant) 
-    # flow = 0
+    if pop_i == 0 or pop_j == 0:
+        flow = 0
+    else:
+        flow = np.exp(
+            B_pop_i * np.log(pop_i) + 
+            B_pop_j * np.log(pop_j) + 
+            B_age_i * np.log(age_i) + 
+            B_age_j * np.log(age_j) +
+            B_inc_i * np.log(inc_i) +
+            B_inc_j * np.log(inc_j) +       
+            B_coastal_i * coastal_i + 
+            B_coastal_j * coastal_j  +
+            B_distance * np.log(distance) +
+            origin_effect +
+            destination_effect +
+            constant)
+    if flow > pop_i:
+        raise ValueError('Number of movers exceeds population size')
     return round(flow)

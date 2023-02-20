@@ -1,13 +1,11 @@
-'''This script is applied to run the model'''
 import os
 import numpy as np
-import pandas as pd
 import rasterio
 import pickle
 
 import faulthandler
 faulthandler.enable()
-# ###################
+np.seterr(all='raise')
 
 from honeybees.visualization.ModularVisualization import ModularServer
 from honeybees.visualization.modules import ChartModule
@@ -63,6 +61,9 @@ def get_study_area(area, admin_level, coastal_only=False):
         if iso3:
             admins = admins[admins['keys'].apply(lambda x: x[:3] in iso3)]
 
+        if coastal_only:
+            admins = admins[admins['keys'].apply(lambda x: x.endswith('flood_plain'))]
+
         xmin, ymin, xmax, ymax = 180, 90, -180, -90
         admin_list = []
         # neighbors = {}
@@ -116,16 +117,20 @@ if __name__ == '__main__':
     parser.add_argument('--profiling', dest='profiling', default=False, action='store_true')
     parser.add_argument('--admin_level', dest='admin_level', type=int, default=1)
     parser.add_argument('--iterations', dest='iterations', type=int, default=1, help="choose the number of model iterations")
-    parser.add_argument('--rcp', dest='rcp', type=str, default='rcp8p5', help=f"choose between control, rcp4p5 and rcp8p5")
+    parser.add_argument('--rcp', dest='rcp', type=str, default='rcp4p5', help=f"choose between control, rcp4p5 and rcp8p5")
+    parser.add_argument('--ssp', dest='ssp', type=str, default='worldpop', help='Choose SSP1-5 or coupled RCP-SSP (coupled), or worldpop')
     parser.add_argument('--coastal-only', dest='coastal_only', action='store_true', help=f"only run the coastal areas")
-    parser.set_defaults(headless=False)
+    parser.add_argument('--config', dest='config', type=str, default='config.yml', help='Choose to config file for the model run.')
+    parser.add_argument('--settings', dest='settings', type=str, default='settings.yml', help='Choose to settings file for the model run.')
+
+    parser.set_defaults(headless=True)
 
     args = parser.parse_args()
 
     study_area = get_study_area(args.area, args.admin_level, args.coastal_only)
 
-    CONFIG_PATH = 'config.yml'
-    SETTINGS_PATH = 'settings.yml'
+    CONFIG_PATH = args.config
+    SETTINGS_PATH = args.settings
 
     MODEL_NAME = 'SLR'
 

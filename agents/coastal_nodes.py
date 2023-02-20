@@ -1,165 +1,17 @@
-'''In this script the agents within the coastal nodes and the aggregated households in the inland nodes are defined.
-It contains the methods to update flood hazard, to process the household decisions, and to process migration flows.'''
-
-
 import numpy as np
 from numba import njit
 import numba as nb
-import yaml
-import random
 import os
-import pandas as pd
-import geopandas as gpd
-from honeybees.agents import AgentBaseClass
-from honeybees.library.raster import pixels_to_coords, pixel_to_coord
+from agents.base_nodes import HouseholdBaseClass
+from honeybees.library.raster import  pixel_to_coord
 from honeybees.library.neighbors import find_neighbors
-from scipy.spatial import distance_matrix as sdistance_matrix
 from scipy import interpolate
-from decision_module import calcEU_no_nothing, calcEU_adapt, EU_migrate, gravity_model
+from hazards.flooding.flood_risk import FloodRisk
+from decision_module import calcEU_no_nothing, calcEU_adapt, EU_migrate
+from hazards.erosion.shoreline_change import find_indices_closest_segment
+from agents.node_properties import CoastalNodeProperties
+from agents.coastal_amenities import total_amenity
 
-from flood_risk_module import stochastic_flood
-from export_agents import export_agents, export_matrix, export_agent_array
-from node_properties import NodeProperties, CoastalNodeProperties, InlandNodeProperties
-from population_change import WorldPopProspectsChange
-
-class HouseholdBaseClass(AgentBaseClass):
-    def __init__(self, model, agents):
-    # Load agent settings
-        with open(model.settings_path) as f:
-            self.settings = yaml.load(f, Loader=yaml.FullLoader)
-        self.model = model
-        self.agents = agents
-        
-        # Find admin name 
-        self.admin_name = self.geom['properties']['id']
-        
-        # Sample region income and distribution for both coastal and inland
-        data = self.model.data.hh_income.sample_geom(self.geom)
-        data = data.ravel()
-        data = data[data != -1]
-        income_region = np.median(data) 
-        self.income_region = income_region 
-
-        # Create income distribution for each region (n=5_000)
-        mean_income = income_region * self.settings['adaptation']['mean_median_inc_ratio']
-        mu = np.log(income_region)
-        sd = np.sqrt(2*np.log(mean_income/income_region))
-        self.income_distribution_region = np.sort(np.random.lognormal(mu, sd, 5_000).astype(np.int32)) # initiate with 2_000 
-    
-        # Sample unemployment rates for both coastal and inland
-        data = self.model.data.unemployment_rate.sample_geom(self.geom)
-        data = data.ravel()
-        data = data[data != -1]
-        unemployment_rate = np.round(np.median(data)) 
-        if np.isnan(unemployment_rate):
-            unemployment_rate = 0
-        self.unemployment_rate = unemployment_rate
-
-        # Initiate the percentage of households implementing dry proofing for all regions
-        self.percentage_adapted = None
-        self.n_people_adapted = None
-        self.perc_people_moved_out = 0
-        self.n_people_adapted = 0
-        self.flood_tracker = 0
-
-        # Initiate expected damages for all regions
-        self.ead_total = 0
-
-        self.n_moved_out_last_timestep = 0
-        self.n_moved_in_last_timestep = 0
-        self.people_moved_out_last_timestep = 0
-
-        self.initiate_agents()
-
-        self.average_amenity_value = 0 # Average amenity value in all regions (coastal will be overwritten). Improve this
-
-    @staticmethod
-    @njit(cache=True)
-    def return_household_sizes(flow_people, max_household_size):
-        '''Small helper function to speed up sampling households from people flow'''
-        # Preallocate empty array
-        household_sizes = np.full(flow_people, -1, dtype=np.int16) # Way too big   
-        i = 0
-        while flow_people > max_household_size:
-            household_size = min([flow_people, np.random.randint(1, max_household_size)])
-            flow_people -= household_size
-            household_sizes[i] = household_size
-            i += 1
-            # allocate last household
-        household_sizes[i] = flow_people
-        household_sizes = household_sizes[np.where(household_sizes != -1)]
-        return household_sizes   
-
-    def ambient_pop_change(self):
-        
-        # Process population growth
-        population_change =  self.agents.population_data.loc[self.admin_name]['change']
-
-
-        international_migration_pp = self.settings['gravity_model']['annual_international_migration']/ np.sum(self.agents.regions.population)
-        population_change += np.floor(international_migration_pp * self.population)
-
-
-        # No nat pop change in spin up period
-        if self.model.config['general']['start_time'].year == self.model.current_time.year:
-            population_change = 0
-
-        # Generate households from new people
-        household_sizes = self.return_household_sizes(int(abs(population_change)), self.max_household_size)
-        return population_change, household_sizes     
-
-    def update_income_distribution_region(self):          
-        self.income_region = round(np.median(self.income))
- 
-    # Generate households moving out of inland nodes
-    @staticmethod
-    @njit
-    def _generate_households(n_households_to_move, household_sizes, move_to_region_per_household,
-                             hh_risk_aversion, init_risk_perception, income_percentiles):
-        # Generate people moving out
-        # sum household sizes to find total number of people moving
-        n_movers = int(household_sizes.sum())
-        # create output arrays people
-        to_region = np.full(n_movers, -1, dtype=np.int32)
-        household_id = np.full(n_movers, -1, dtype=np.int32)
-        gender = np.full(n_movers, -1, dtype=np.int8)
-        risk_aversion = np.full(n_movers, -1, dtype=np.float32)
-        age = np.full(n_movers, -1, dtype=np.int8)
-        income_percentile = np.full(n_households_to_move, -99, dtype=np.int32)
-        income = np.full(n_movers, 0, dtype=np.float32)
-        risk_perception = np.full(n_movers, init_risk_perception, dtype=np.float32)
-
-        # fill households
-        start_idx = 0
-        for i in range(n_households_to_move):
-            end_idx = start_idx + int(household_sizes[i])
-            to_region[start_idx: end_idx] = move_to_region_per_household[i]
-            household_id[start_idx: end_idx] = i
-            gender[start_idx: end_idx] = np.random.randint(0, 2, size=end_idx - start_idx)
-            risk_aversion[start_idx: end_idx] = np.full((end_idx - start_idx), hh_risk_aversion) 
-            age[start_idx: end_idx] = np.random.randint(0, 85, size=end_idx - start_idx)
-
-            start_idx = end_idx
-
-        assert end_idx == n_movers
-        return n_movers, to_region, household_id, gender, risk_aversion, age, income_percentile, income, risk_perception       
-
-
-    @property
-    def n_moved_out_last_timestep(self):
-        return self._n_moved_out_last_timestep
-
-    @n_moved_out_last_timestep.setter
-    def n_moved_out_last_timestep (self, value):
-        self._n_moved_out_last_timestep = value
-
-    @property
-    def n_moved_in_last_timestep(self):
-        return self._n_moved_in_last_timestep
-
-    @n_moved_in_last_timestep.setter
-    def n_moved_in_last_timestep(self, value):
-        self._n_moved_in_last_timestep = value
 
 
 class CoastalNode(HouseholdBaseClass, CoastalNodeProperties):
@@ -214,19 +66,55 @@ class CoastalNode(HouseholdBaseClass, CoastalNodeProperties):
         self.n_households_per_region = n_households_per_region
         self.init_folder = init_folder
         self.max_household_size = max_household_size
-       
-        super(CoastalNode, self).__init__(model, agents) 
         HouseholdBaseClass.__init__(self, model, agents)
+        np.random.seed(0)
+        self.model.set_seed(0)
 
-        # amenity_values_region = self.model.data.amenity_value.get_array()
-        # amenity_values_region[amenity_values_region<0] = 100 # PRELIMINARY WAY TO DEAL WITH NODATA VALUES
-        # self.amenity_values_region = amenity_values_region
 
-    
     def initiate_agents(self):
         self._initiate_locations()
         self._initiate_household_attributes()
         self._initiate_person_attributes()
+        self._initiate_shoreline_change_admin()
+        self._initiate_utility_surface()
+        self.calculate_flood_risk()
+        # self.process_coastal_erosion()
+
+    def _initiate_utility_surface(self):
+        # assign suitability matrix
+        admin_indices = self.geom['properties']['gadm']['indices']
+
+        # Get coords associated with pixels in admin region
+        px = admin_indices[1][:] + 0.5
+        py = admin_indices[0][:] + 0.5
+
+        locations_admin_cells = pixel_to_coord(px=px, py=py, gt=self.geom['properties']['gadm']['gt'])
+        self.locations_admin_cells = np.stack([locations_admin_cells[0], locations_admin_cells[1]], axis = 1)
+
+        # Sample values for all admin cells
+        ead_array_admin_cells = self.model.data.ead_map.sample_coords(self.locations_admin_cells, dt = self.model.current_time) # only done once. Fix creation of flood risk class
+        dist_to_coast_admin_cells = self.model.data.distance_to_coast.sample_coords(self.locations_admin_cells)
+        
+        # Sample traveltime to city density (static)
+        
+
+        # # Adjust for min and max distance and apply amenity function
+        dist = np.array(self.model.data.coastal_amenity_functions['dist2coast'].index)
+        amenity_factor = np.array(self.model.data.coastal_amenity_functions['dist2coast']['premium'])
+        calc_amenity = interpolate.interp1d(x = dist, y = amenity_factor)
+        dist_to_coast_admin_cells = np.maximum(min(dist),  dist_to_coast_admin_cells)
+        dist_to_coast_admin_cells = np.minimum(max(dist),  dist_to_coast_admin_cells)
+
+        # # Calculate utility of all cells
+        self.coastal_amenity_cells = calc_amenity(dist_to_coast_admin_cells) * self.wealth.mean()
+        self.damages_coastal_cells = ead_array_admin_cells * self.property_value.mean()
+        
+        # Extract urban classes for urban mask 
+        urban_classes = self.model.data.SMOD.sample_coords(self.locations_admin_cells) 
+
+        # Urban mask
+        smod_class = 13 #“Rural cluster grid cell”, if the cell belongs to a Rural Cluster spatial entity;
+        self.smod_mask = np.where(urban_classes >= smod_class) # all urban intenitities including and above the rural urban claster class
 
     def _load_initial_state(self):
         self.load_timestep_data()
@@ -246,6 +134,11 @@ class CoastalNode(HouseholdBaseClass, CoastalNodeProperties):
         self._locations = np.full((self.max_n, 2), np.nan, dtype=np.float32)
         self.locations = household_locations
 
+    def _initiate_shoreline_change_admin(self):
+        names = [self.geom_id, self.geom_id[:-12]]
+        self.segment_indices_within_admin = np.array(self.model.data.beach_ids.loc[self.model.data.beach_ids['keys'].isin(names)].index)
+
+            
     @staticmethod
     @njit
     def _generate_household_id_per_person(people_indices_per_household: np.ndarray, n_people: int) -> np.ndarray:
@@ -292,10 +185,12 @@ class CoastalNode(HouseholdBaseClass, CoastalNodeProperties):
         if os.path.exists(people_indices_per_household_fn):
             self.people_indices_per_household = np.load(people_indices_per_household_fn)
 
+        self.total_shoreline_change_admin = 0
+
         # Initiate wealth, income, flood experience and adaptation status
         self._ead = np.full(self.max_n, -1)
-        self._ead_dryproof = np.full(self.max_n, -1)
-        self._adapt = np.full(self.max_n, -1)
+        self._ead_dryproof = np.full(self.max_n, -1,  dtype=np.float32)
+        self._adapt = np.full(self.max_n, -1,  dtype=np.float32)
         self._time_adapt = np.full(self.max_n, -1)
         self._income = np.full(self.max_n, -1)
         self._flooded = np.full(self.max_n, -1)
@@ -308,13 +203,13 @@ class CoastalNode(HouseholdBaseClass, CoastalNodeProperties):
 
         # Position in the income distribution (related to eduction/ age etc)
         self._income_percentile = np.full(self.max_n, -1)
-        self.income_percentile = np.random.randint(0, 100, self.n)
+        self.income_percentile = np.random.randint(1, 100, self.n)
 
         self._income = np.full(self.max_n, -1)
         self.income = np.percentile(self.income_distribution_region, self.income_percentile)
                           
         self._property_value = np.full(self.max_n, -1)
-        self.property_value = self.settings['flood_risk_calculations']['property_value']
+        self.property_value = self.model.settings['flood_risk_calculations']['property_value']
 
         # Create dict of income/ wealth ratio and interpolate
         perc = np.array([0, 20, 40, 60, 80, 100])
@@ -326,107 +221,23 @@ class CoastalNode(HouseholdBaseClass, CoastalNodeProperties):
         self.wealth[self.wealth < self.property_value] = self.property_value[self.wealth < self.property_value] 
         
         self._decision_horizon = np.full(self.max_n, -1)
-        self.decision_horizon = self.settings['decisions']['decision_horizon']
+        self.decision_horizon = self.model.settings['decisions']['decision_horizon']
         
         self._hh_risk_aversion = np.full(self.max_n, -1, dtype= np.float32)
-        self.hh_risk_aversion = self.settings['decisions']['risk_aversion']
+        self.hh_risk_aversion = self.model.settings['decisions']['risk_aversion']
 
         self._risk_perception = np.full(self.max_n, -1, dtype = np.float32)
-        self.risk_perception = self.settings['flood_risk_calculations']['risk_perception']['min']
+        self.risk_perception = self.model.settings['flood_risk_calculations']['risk_perception']['min']
 
         self._flood_timer = np.full(self.max_n, -1, dtype = np.int32)
         self.flood_timer = 99 # Assure new households have min risk perceptions
 
-        # Initiate amenity distance decay function (interpolate between values of Conroy & Milosch 2011)
-        dist_km = np.array([0, .500, 1, 10, 20, 1E6])
-        amenity_premium = np.array([0.60, 0.60, 0.10, 0.03, 0, 0])
+        self._shoreline_change_agent = np.full(self.max_n, -1, dtype = np.float32)
+        self.shoreline_change_agent = 0
 
-        self.coastal_amenity_function =  interpolate.interp1d(dist_km, amenity_premium)
-
-        dist_to_coast = np.ceil(self.model.data.dist_to_coast.sample_coords(self.locations, cache=True) * 2)/ 2
-        dist_to_coast[dist_to_coast == 0] = 0.5
-        self.amenity_value = self.coastal_amenity_function(dist_to_coast) * self.wealth 
-        
-        # self.amenity_value = 10_000
+        self._beach_proximity_bool =  np.full(self.max_n, False, dtype = bool)
+                
         self.average_amenity_value = 0
-
-    def sample_water_level(self):
-        """This function creates a dictionary of water levels for inundation events of different return periods.
-        It uses the sample coordenates method of the ArrayReader class instances loaded in data.py. The inundation maps
-        are selected based on the scenario defined in the terminal command 'rcp'."""
-        
-        self.rts = np.array([1000, 500, 250, 100, 50, 25, 10, 5, 2])
-        self.water_level_hist = {}
-        self.water_level_2080 = {}
-
-        # Fill water levels by sampling agent locations
-        
-        for i in self.rts:
-            self.water_level_hist[i] =  self.model.data.inundation_maps_hist[i].sample_coords(self.locations, cache=True)
-
-        if self.model.args.rcp == 'control':
-            self.water_level_2080 = self.water_level_hist
-        else:
-            for i in self.rts:
-                self.water_level_2080[i] =  self.model.data.inundation_maps_2080[i].sample_coords(self.locations, cache=True)
-        
-        # Interpolate water level between year 2000 and 2080
-        self.water_level = {}
-    
-        # Extract start time from config
-        start_time = self.model.config['general']['start_time'].year
-        timestep = self.model.current_time.year - start_time
-
-        # Derive current water depth based on linear interpolation
-        for rt in self.rts:
-            self.water_level_hist[rt][self.water_level_hist[rt] < 0.001] = 0
-            self.water_level_2080[rt][self.water_level_2080[rt] < 0.001] = 0
-            difference = (self.water_level_2080[rt] - self.water_level_hist[rt])/ (2080 - start_time)
-            self.water_level[rt] = self.water_level_hist[rt] + difference * timestep
-        
-        # Read protection standard and set inundations levels to 0 if protected
-        fps = self.settings['flood_risk_calculations']['flood_protection_standard']
-        for rt in self.water_level:
-            if rt < fps:
-                self.water_level[rt] = np.zeros(len( self.water_level[rt]))
-
-    def calculate_ead(self):
-        # Interpolate damage factor based on damage curves  
-        func_dam = interpolate.interp1d(self.model.data.curves['index'],self.model.data.curves[0])
-        func_dam_dryproof_1m = interpolate.interp1d(self.model.data.curves_dryproof_1m['index'],self.model.data.curves_dryproof_1m[0])
-        
-        # Indicate maximum damage per household
-        max_dam = self.property_value
-        # pre-allocate empty array with shape (3, self.n) for number of damage levels and number of households
-        self.damages = np.zeros((len(self.rts), self.n), dtype=np.float32)
-        
-        for i, rt in enumerate(self.rts):
-            self.water_level[rt][self.water_level[rt] < 0] = 0
-            self.water_level[rt][self.water_level[rt] > 6] = 6
-            # calculate damage per retun period and store in damage dictory
-            # place the damage output in the empty array
-            self.damages[i] = func_dam(self.water_level[rt]) * max_dam
-        x = 1 / self.rts
-        # calculate ead on damage array along the first axis
-        self.ead = np.trapz(self.damages, x, axis=0)        
-        
-        # pre-allocate empty array with shape (3, self.n) for number of damage levels and number of households
-        self.damages_dryproof_1m = np.zeros((len(self.rts), self.n), dtype=np.float32)
-        for i, rt in enumerate(self.rts):
-            self.water_level[rt][self.water_level[rt] < 0] = 0
-            self.water_level[rt][self.water_level[rt] > 6] = 6
-            # calculate damage per retun period and store in damage dictory
-            # place the damage output in the empty array
-            self.damages_dryproof_1m[i] = func_dam_dryproof_1m(self.water_level[rt]) * max_dam
-        x = 1 / self.rts
-        # calculate ead on damage array along the first axis
-        self.ead_dryproof = np.trapz(self.damages_dryproof_1m, x, axis=0)  
-        
-        # Sum and update expected damages per node
-        agents_that_adapted = np.where(self.adapt == 1)
-        agents_not_adapted = np.where(self.adapt == 0)
-        
-        self.ead_total = np.sum(self.ead[agents_not_adapted]) + np.sum(self.ead_dryproof[agents_that_adapted])
 
     def _initiate_person_attributes(self):
         n_people = np.count_nonzero(self._people_indices_per_household != -1)
@@ -449,7 +260,7 @@ class CoastalNode(HouseholdBaseClass, CoastalNodeProperties):
         self._household_id_per_person = np.full(self.max_n_people, -1, dtype=np.int32)
         self.household_id_per_person = self._generate_household_id_per_person(self._people_indices_per_household, self.size.sum())
         
-        hh_risk_aversion = np.full(self.n, self.settings['decisions']['risk_aversion'], dtype=np.float32)
+        hh_risk_aversion = np.full(self.n, self.model.settings['decisions']['risk_aversion'], dtype=np.float32)
         person_risk_aversion = np.take(hh_risk_aversion, self.household_id_per_person)     
         
         # # create redundancy array for concentenating 
@@ -474,10 +285,85 @@ class CoastalNode(HouseholdBaseClass, CoastalNodeProperties):
     def process(self):
         self._household_id_per_person = self._generate_household_id_per_person(self._people_indices_per_household, self.size.sum())       
 
-    def initiate_household_attributes_movers(self, n_movers):
-        '''This function assigns new household attributes to the households that moved in. It takes all arrays and fills in the missing data based on sampling.'''
+    def update_utility_surface(self):
+        # Read ead from flood risk class instance
+        ead_array_admin_cells = self.model.flood_risk.ead_admin_cells[self.geom_id]      
+        self.damages_coastal_cells = ead_array_admin_cells * self.property_value.mean()
+
+    def calculate_flood_risk(self): # Change this to calculate risk
+      
+        self.water_level = FloodRisk.sample_water_level(
+            locations = self.locations,
+            return_periods = np.array([key for key in  self.model.data.inundation_maps_hist.keys()]),
+            fps = self.model.settings['flood_risk_calculations']['flood_protection_standard'],
+            inundation_maps = [self.model.data.inundation_maps_hist, self.model.data.inundation_maps_2080],
+            rcp = self.model.args.rcp,
+            start_year = self.model.config['general']['start_time'].year,
+            current_year = self.model.current_time.year)
+       
+        self.damages, self.damages_dryproof_1m, self.ead, self.ead_dryproof = FloodRisk.calculate_ead(
+            n_agents = self.n,
+            water_level = self.water_level,
+            damage_curves = self.model.data.curves,
+            property_value = self.property_value,
+            return_periods = np.array([key for key in  self.model.data.inundation_maps_hist.keys()]))
+
+        self.flooded, self.flood_count, self.risk_perception, self.flood_timer, self.flood_tracker = FloodRisk.stochastic_flood(
+            water_levels = self.water_level,
+            return_periods = np.array([key for key in  self.model.data.inundation_maps_hist.keys()]),
+            flooded = self.flooded,
+            flood_count = self.flood_count,
+            risk_perceptions = self.risk_perception,
+            flood_timer = self.flood_timer,
+            risk_perc_min = self.model.settings['flood_risk_calculations']['risk_perception']['min'],
+            risk_perc_max = self.model.settings['flood_risk_calculations']['risk_perception']['max'],
+            risk_decr = self.model.settings['flood_risk_calculations']['risk_perception']['coef'],
+            settings = self.model.settings['general']['flood'],
+            current_year=self.model.current_time.year,
+            spin_up_flag = self.model.spin_up_flag,
+            flood_tracker= self.flood_tracker)       
+
+        self.ead_total = np.sum(self.ead[self.adapt == 0]) + np.sum(self.ead_dryproof[self.adapt == 1])
+
+    def process_coastal_erosion(self):               
+        self.beach_proximity_bool = self.model.data.coastal_raster.sample_coords(self.locations) == 1
+        self.people_near_beach = np.sum(self.size[self.beach_proximity_bool])
+        self.households_near_beach = np.sum(self.beach_proximity_bool)
+        segment_location_admin = self.model.agents.beaches.segment_locations[self.segment_indices_within_admin]
+        beach_width_agent = np.full(self.n, 0, dtype=np.float32)
+
+        # Find beach segment closts to agent
+        if segment_location_admin.size > 0:
+            segment_indices_agent = find_indices_closest_segment(self.locations, segment_location_admin, self.beach_proximity_bool)
+            beach_width_agent[self.beach_proximity_bool] = self.model.agents.beaches.beach_width[segment_indices_agent]
+        else: 
+            segment_indices_agent = np.array([])
+        #extract beach width experienced by agent
+
+        # Calculate amenities based on beach proximity and distance to coast
+        self.amenity_value, beach_amenity = total_amenity(
+            coastal_amenity_functions = self.model.data.coastal_amenity_functions, 
+            beach_proximity_bool = self.beach_proximity_bool, 
+            dist_to_coast_raster = self.model.data.distance_to_coast,
+            agent_locations = self.locations, 
+            beach_width = beach_width_agent,
+            agent_wealth = self.wealth,
+        )
         
-        assert self.income[-n_movers] == -1 
+        self.add_segment_value(segment_indices_agent, beach_amenity)
+        # self.average_amenity_value = np.min([np.median(self.amenity_value), 15_000])
+
+    def add_segment_value(self, segment_indices_agent, beach_amenity):
+        # Sum beach amenity value for each coastal segment (vectorize this, although quite fast already)
+        if segment_indices_agent.size > 0:
+            for agent, segment in enumerate(segment_indices_agent):
+                self.model.agents.beaches.value_segment[segment] += beach_amenity[agent]
+        
+        
+    def initiate_household_attributes_movers(self, n_movers):
+        '''This function assigns new household attributes to the households that moved into a floodplain. It takes all arrays and fills in the missing data based on sampling.'''
+        
+        assert n_movers == 0 or self.income[-n_movers] == -1 
         
         # Sample income percentile for households moving in from inland node or natural pop change
         # Find neighbors for newly generated households
@@ -485,14 +371,13 @@ class CoastalNode(HouseholdBaseClass, CoastalNodeProperties):
 
         # Fill
         neighbor_households_1km = find_neighbors(locations=self.locations, radius=1_000, n_neighbor=30, bits=32, search_ids=new_households)
-        neighbor_households_3km = find_neighbors(locations=self.locations, radius=3_000, n_neighbor=30, bits=32, search_ids=new_households)
-
-
         for i, household in enumerate(new_households):
+            
             # Get neighbors
             neighboring_hh = neighbor_households_1km[i, :]
             
-            if neighboring_hh.size == 0:             
+            if neighboring_hh.size == 0:
+                neighbor_households_3km = find_neighbors(locations=self.locations, radius=3_000, n_neighbor=30, bits=32, search_ids=new_households)           
 
                 # If no neighbors found increase search radius
                 neighboring_hh = neighbor_households_3km[i, :]
@@ -523,73 +408,45 @@ class CoastalNode(HouseholdBaseClass, CoastalNodeProperties):
         self.wealth[-n_movers:self.n]= self.income[-n_movers:self.n] * self.income_wealth_ratio(self.income_percentile[-n_movers:self.n])
         
         # All agents have the same property value
-        self.property_value[-n_movers:self.n] = self.settings['flood_risk_calculations']['property_value']
+        self.property_value[-n_movers:self.n] = self.model.settings['flood_risk_calculations']['property_value']
 
         # Set wealth to never be lower than property value
         self.wealth[self.wealth < self.property_value] = self.property_value[self.wealth < self.property_value] 
         
         # Set decision horizon and flood timer
-        self.decision_horizon[self.decision_horizon == -1] = self.settings['decisions']['decision_horizon']
+        self.decision_horizon[self.decision_horizon == -1] = self.model.settings['decisions']['decision_horizon']
         self.flood_timer[self.flood_timer == -1] = 99
-
-        # Initiate amenity distance decay function (interpolate between values of Conroy & Milosch 2011)
-        dist_to_coast = np.ceil(self.model.data.dist_to_coast.sample_coords(self.locations, cache=True) * 2)/ 2
-        dist_to_coast[dist_to_coast == 0] = 0.5
-        self.amenity_value = self.coastal_amenity_function(dist_to_coast) * self.wealth 
-        
+       
         # self.amenity_value = 10_000
-        self.average_amenity_value = 0
+        # self.average_amenity_value = 0
 
         # Reset flood status to 0 for all households (old and new) and adaptation to 0 for new households
         self.adapt[-n_movers:] = 0
         self.flood_count[-n_movers:] = 0
         
-        # Uncomment if we want to update income based on agent population in the flood zone
-        # self.update_income_distribution_region() 
-
-    def update_flood(self):
-        '''In this function the flood risk perception attribute of each agent is updated through simulated flood events using the
-        flood risk module.
-        '''
-        # reset flooded to 0 for all households
-        self.flooded = 0 
-        self.flood_tracker = 0
-        self.flooded, self.flood_count, self.risk_perception, self.flood_timer, self.flood_tracker = stochastic_flood(
-            water_levels= self.water_level,
-            return_periods=self.rts,
-            flooded=self.flooded,
-            flood_count=self.flood_count,
-            risk_perceptions=self.risk_perception,
-            flood_timer = self.flood_timer,
-            risk_perc_min = self.settings['flood_risk_calculations']['risk_perception']['min'],
-            risk_perc_max = self.settings['flood_risk_calculations']['risk_perception']['max'],
-            risk_decr = self.settings['flood_risk_calculations']['risk_perception']['coef'],
-            settings = self.settings['general']['flood'],
-            current_year=self.model.current_time.year,
-            spin_up_flag = self.model.spin_up_flag,
-            flood_tracker= self.flood_tracker)       
-
     def process_population_change(self):
         population_change, household_sizes = self.ambient_pop_change()
-        # Select households to remove from
+        
         households_to_remove = []
-        if population_change < 0 and self.n > household_sizes.size:
-            for size in np.sort(household_sizes):
-                # find a corresponding household size and remove (if not found remove smallest household for now)
-                try:
-                    household_to_remove = np.where(self.size == size)[0][0]
-                except:
-                    household_to_remove = np.where(self.size == np.sort(self.size)[0])[0][0]
-                # Check if household is already tagged for removal
-                j = 0
-                while household_to_remove in households_to_remove:
-                    household_to_remove = np.where(self.size == size)[0][j]
-                    j += 1
-                households_to_remove.append(household_to_remove)
+        if population_change < 0 and self.population > abs(population_change):
 
-            households_to_remove = np.sort(households_to_remove)[::-1]
+            # Select households to remove from
+            # Sample the households that are due for removal from self.size
+            individuals_removed = 0
+            households_to_remove = []
+            i = 0
 
-            n_movers = np.sum(household_sizes)
+            # iterate while number of individuals removed does not meet projections or iterations exceed limit
+            while individuals_removed < abs(population_change) and i < 1E6:
+                # print(f'iteration {i}')
+                household = np.random.randint(0, self.size.size)
+                if household not in households_to_remove:
+                    individuals_removed += self.size[household]
+                    households_to_remove.append(household)
+                i += 1
+            households_to_remove = np.sort(households_to_remove)[::-1]          
+
+            n_movers = np.sum(self.size[households_to_remove])
             move_to_region = np.full(n_movers, self.admin_idx, dtype=np.int32) # Placeholder, will not do anythin with this 
 
             # Remove households from abm
@@ -629,8 +486,8 @@ class CoastalNode(HouseholdBaseClass, CoastalNodeProperties):
                 n_households_to_move=household_sizes.size,
                 household_sizes=household_sizes,
                 move_to_region_per_household = np.full(household_sizes.size, self.admin_idx), # new households as 'moved' to own region
-                hh_risk_aversion = self.settings['decisions']['risk_aversion'],
-                init_risk_perception = self.settings['flood_risk_calculations']['risk_perception']['min'],
+                hh_risk_aversion = self.model.settings['decisions']['risk_aversion'],
+                init_risk_perception = self.model.settings['flood_risk_calculations']['risk_perception']['min'],
                 income_percentiles = nb.typed.List(self.model.agents.regions.income_percentiles_regions)
             )
             person_income_percentile = np.take(income_percentile, household_id)
@@ -654,21 +511,25 @@ class CoastalNode(HouseholdBaseClass, CoastalNodeProperties):
         elif population_change == 0:
             pass   
 
-           
-
     def step(self):
-        if self.model.current_time.year > self.model.config['general']['start_time'].year:
+        if self.model.current_time.year > self.model.config['general']['start_time'].year and self.model.settings['general']['include_ambient_pop_change']:
             self.process_population_change()
         self.load_timestep_data()
         self.process()
-        self.sample_water_level()
-        self.calculate_ead()
-        self.update_flood()
+        if self.model.config['general']['create_agents']:
+            self.calculate_flood_risk()
+            self.process_coastal_erosion()
+            self.update_utility_surface()
 
     @staticmethod
     @njit
     def add_numba(
         n: int,
+        cells_to_assess,
+        smod_mask,
+        damages_coastal_cells,
+        coastal_amenity_cells,
+        amenity_weight,
         people_indices_per_household: np.ndarray,
         household_id_per_person: np.ndarray,
         empty_index_stack: np.ndarray,
@@ -690,7 +551,6 @@ class CoastalNode(HouseholdBaseClass, CoastalNodeProperties):
         risk_perception: np.ndarray,
         hh_risk_aversion: np.ndarray,
         admin_indices: np.ndarray,
-        p_suitability: np.ndarray, 
         gt: tuple[float, float, float, float, float, float],
     ) -> None:
         """This function adds new households to a region. As input the function takes as input the characteristics of the people moving in, and inserts them into the current region. For example, for individual people the data from `age_movers` is inserted into `age`. Likewise the size of the household is inserted into `size`.
@@ -715,10 +575,9 @@ class CoastalNode(HouseholdBaseClass, CoastalNodeProperties):
             gt: The geotransformation for the cell indices.
         """
 
-        all_cells = np.arange(0, admin_indices[0].size, dtype=np.float32)       
-
         for index_first_person_in_household, new_household_size, new_income_percentile, new_risk_perception, new_risk_aversion in zip(index_first_persons_in_household, new_household_sizes, new_income_percentiles, new_risk_perceptions, new_risk_aversions):
             n += 1
+            assert n > 0
             assert size[n-1] == -1
             assert income_percentile[n-1] == -1
 
@@ -755,13 +614,35 @@ class CoastalNode(HouseholdBaseClass, CoastalNodeProperties):
 
             # Uncomment for random allocation in the flood zone
             # cell = random.randint(0, admin_indices[0].size-1) # Select random cell
+            # Apply a random sample of 10 cells:
+            sample_size = np.minimum(10, smod_mask[0].size)
+            cells_to_assess = np.random.choice(smod_mask[0], size = sample_size, replace=False)
+            
+            # select cells to assess by the agent
+            damages_coastal_cells_agent = damages_coastal_cells[cells_to_assess]
+            coastal_amenity_cells_agent = coastal_amenity_cells[cells_to_assess]
 
-            # Select random cell based on probabilities derived from suitability values
-            cell = int(all_cells[np.searchsorted(np.cumsum(p_suitability), np.random.rand())])
+            # multiply expected damages with risk perception of the households
+            agent_risk_perception = np.maximum(0.01, new_risk_perception) # account for risk perceptions of -1, will be set later (household not moving in from other coastal nodes)
+            damages_coastal_cells_agent = agent_risk_perception * damages_coastal_cells_agent 
 
-            # Allocate randomly in 1km2 grid cell (otherwise all agents the center of the cell)
-            px = admin_indices[1][cell] + random.random()
-            py = admin_indices[0][cell] + random.random()
+            # multiply amenity value with amenity weight
+            coastal_amenity_cells_agent = coastal_amenity_cells_agent * amenity_weight
+
+            # calculate utility cells
+            utility_cells = coastal_amenity_cells_agent - damages_coastal_cells_agent
+
+            # pick cell with highest utility
+            cell = np.argsort(utility_cells)[-1:]
+
+            if cell.size == 0: # if no urban cells in floodplain distribute randomly
+                cell = np.random.randint(0, admin_indices[0].size)
+            else:
+                cell = cell[0] # array should be unpacked for njit
+
+            # Allocate randomly in 1km2 grid cell (otherwise all agents the center of the cell) # Are actually positioned at the top left corner
+            px = admin_indices[1][cell] + np.random.random()
+            py = admin_indices[0][cell] + np.random.random()
 
             locations[n-1] = pixel_to_coord(px, py, gt)
 
@@ -776,20 +657,15 @@ class CoastalNode(HouseholdBaseClass, CoastalNodeProperties):
         new_risk_perceptions =  people['risk_perception'][index_first_persons_in_household]
         new_risk_aversions = people['risk_aversion'][index_first_persons_in_household]
 
-        self.n_moved_in_last_timestep = index_first_persons_in_household.size
-        
-        # assign suitability matrix
-        suitability = self.model.data.suitability_arr 
-        admin_indices = self.geom['properties']['gadm']['indices']
-        
-        if np.sum(suitability[admin_indices]) == 0:
-           suitability[admin_indices] = 0.01 # If no urban area present distribute agents randomnly within flood zone
-           print(f'no urban area in {self.admin_name}')
-
-        p_suitability = suitability[admin_indices]/np.sum(suitability[admin_indices])
+        self.n_moved_in_last_timestep = index_first_persons_in_household.size    
 
         self.n, self._empty_index_stack_counter = self.add_numba(
             n=self.n,
+            cells_to_assess = self.model.settings['decisions']['migration']['cells_to_assess'],
+            smod_mask=self.smod_mask,
+            damages_coastal_cells=self.damages_coastal_cells,
+            coastal_amenity_cells=self.coastal_amenity_cells,
+            amenity_weight=self.model.settings['decisions']['migration']['amenity_weight'],
             people_indices_per_household=self._people_indices_per_household,
             household_id_per_person=self._household_id_per_person,
             empty_index_stack=self._empty_index_stack,
@@ -810,7 +686,6 @@ class CoastalNode(HouseholdBaseClass, CoastalNodeProperties):
             income_percentile = self._income_percentile,
             risk_perception=self._risk_perception,
             hh_risk_aversion=self._hh_risk_aversion,
-            p_suitability=p_suitability,
             admin_indices=self.geom['properties']['gadm']['indices'],
             gt=self.geom['properties']['gadm']['gt']
         )
@@ -975,6 +850,9 @@ class CoastalNode(HouseholdBaseClass, CoastalNodeProperties):
         '''This function processes the individual household agent decisions. It calls the functions to calculate
         expected utility of stayin, adapting, and migrating to different regions. Agents that decide to move are
         then removed from the arrays'''
+        # Average household income and update GINI, store for export
+        self.average_household_income = self.income.mean()
+        
         # Reset counters
         self.n_moved_out_last_timestep = 0
         self.n_moved_in_last_timestep = 0
@@ -982,8 +860,8 @@ class CoastalNode(HouseholdBaseClass, CoastalNodeProperties):
         self.perc_people_moved_out = 0
 
         # Assign risk aversion sigma and time discounting preferences
-        sigma = self.settings['decisions']['risk_aversion']
-        r_time = self.settings['decisions']['time_discounting']
+        sigma = self.model.settings['decisions']['risk_aversion']
+        r_time = self.model.settings['decisions']['time_discounting']
         
         # Run some checks to assert all households have attribute values
         # assert (sigma != -1).all()
@@ -995,8 +873,8 @@ class CoastalNode(HouseholdBaseClass, CoastalNodeProperties):
         assert (self.hh_risk_aversion != -1).all() # Not used in decisions, all households currently have the same risk aversion setting (sigma).
 
         # Reset timer and adaptation status when lifespan of dry proofing is exceeded 
-        self.adapt[self.time_adapt == self.settings['adaptation']['lifespan_dryproof']] = 0
-        self.time_adapt[self.time_adapt == self.settings['adaptation']['lifespan_dryproof']] = -1 # People have to make adaptation choice again.
+        self.adapt[self.time_adapt == self.model.settings['adaptation']['lifespan_dryproof']] = 0
+        self.time_adapt[self.time_adapt == self.model.settings['adaptation']['lifespan_dryproof']] = -1 # People have to make adaptation choice again.
        
         # Only select region for calculations if agents experience flood risk
         if self.ead.size:
@@ -1005,27 +883,28 @@ class CoastalNode(HouseholdBaseClass, CoastalNodeProperties):
             expected_damages_adapt = np.array(self.damages_dryproof_1m)
 
             # Convert adaptation cost to annual cost based on loan duration and interest rate
-            total_cost = self.settings['adaptation']['adaptation_cost']
-            loan_duration = self.settings['adaptation']['loan_duration']
-            r_loan =  self.settings['adaptation']['interest_rate']
+            total_cost = self.model.settings['adaptation']['adaptation_cost']
+            loan_duration = self.model.settings['adaptation']['loan_duration']
+            r_loan =  self.model.settings['adaptation']['interest_rate']
 
             # Calculate annnual costs of adaptation loan based on interest rate and loan duration
             annual_cost = total_cost * (r_loan *( 1+r_loan) ** loan_duration/ ((1+r_loan)**loan_duration -1))
             
             # Fix risk perception at zero for a scenario of no dynamic behavior (not the best name)
-            if not self.settings['general']['dynamic_behavior'] and not self.model.spin_up_flag:
+            if not self.model.settings['general']['dynamic_behavior'] and not self.model.spin_up_flag:
                 self.risk_perception *= 0
 
             # Collect all params in dictionary
-            decision_params = {'loan_duration': self.settings['adaptation']['loan_duration'],
-                'expendature_cap': self.settings['adaptation']['expenditure_cap'],
-                'lifespan_dryproof' : self.settings['adaptation']['lifespan_dryproof'],
+            decision_params = {'loan_duration': self.model.settings['adaptation']['loan_duration'],
+                'expendature_cap': self.model.settings['adaptation']['expenditure_cap'],
+                'lifespan_dryproof' : self.model.settings['adaptation']['lifespan_dryproof'],
                 'n_agents':  self.n,
                 'sigma': sigma, 
                 'wealth': self.wealth, 
                 'income': self.income, 
                 'amenity_value': self.amenity_value,
-                'p_floods': 1/ self.rts, 
+                'amenity_weight': self.model.settings['decisions']['migration']['amenity_weight'],
+                'p_floods': 1/ np.array([key for key in self.model.data.inundation_maps_hist.keys()]), 
                 'risk_perception': self.risk_perception, 
                 'expected_damages': expected_damages,
                 'expected_damages_adapt': expected_damages_adapt, 
@@ -1040,7 +919,7 @@ class CoastalNode(HouseholdBaseClass, CoastalNodeProperties):
             
 
             # Determine EU of adaptation (set to -inf if we want to exclude this behavior)
-            if self.settings['general']['include_adaptation'] or self.model.spin_up_flag:
+            if self.model.settings['general']['include_adaptation'] or self.model.spin_up_flag:
                 EU_adapt = calcEU_adapt(**decision_params)
             else:
                 EU_adapt = calcEU_adapt(**decision_params)
@@ -1052,10 +931,10 @@ class CoastalNode(HouseholdBaseClass, CoastalNodeProperties):
             assert(EU_do_nothing != -1).any or (EU_adapt != -1).any()
             
             # Check if we want to model migration
-            if (self.settings['general']['include_migration'] or self.model.spin_up_flag) and not self.model.calibrate_flag:
+            if (self.model.settings['general']['include_migration'] or self.model.spin_up_flag) and not self.model.calibrate_flag:
             
                 # Select 25 closest regions
-                regions_select = np.argsort(self.distance_vector)[1:self.settings['decisions']['regions_included_in_migr']+1] # closest regions and exclude own region
+                regions_select = np.argsort(self.distance_vector)[1:self.model.settings['decisions']['regions_included_in_migr']+1] # closest regions and exclude own region
                 
                 
                 # Determine EU of migration and which region yields the highest EU
@@ -1068,12 +947,13 @@ class CoastalNode(HouseholdBaseClass, CoastalNodeProperties):
                     wealth = self.wealth,
                     income_distribution_regions = income_distribution_regions,
                     income_percentile = self.income_percentile,
-                    amenity_value_regions = np.array(self.model.agents.regions.amenity_value_regions, dtype=np.int32),
+                    amenity_value_regions = self.model.agents.regions.amenity_value_regions,
+                    amenity_weight=self.model.settings['decisions']['migration']['amenity_weight'],
                     distance = self.distance_vector,
                     T = self.decision_horizon,
                     r = r_time,
-                    Cmax = self.settings['decisions']['migration']['max_cost'],
-                    cost_shape =  self.settings['decisions']['migration']['cost_shape']
+                    Cmax = self.model.settings['decisions']['migration']['max_cost'],
+                    cost_shape =  self.model.settings['decisions']['migration']['cost_shape']
                 )
 
                 EU_migr_MAX = EU_migr_MAX
@@ -1083,7 +963,7 @@ class CoastalNode(HouseholdBaseClass, CoastalNodeProperties):
 
                 # Intentions to behavior
                 households_intenting_to_move =  np.where(EU_mig_bool == True)
-                households_not_moving = np.random.choice(households_intenting_to_move[0], int((1-self.settings['decisions']['migration']['intention_to_behavior']) * households_intenting_to_move[0].size))
+                households_not_moving = np.random.choice(households_intenting_to_move[0], int((1-self.model.settings['decisions']['migration']['intention_to_behavior']) * households_intenting_to_move[0].size), replace = False)
                 EU_mig_bool[households_not_moving] = False
 
                 EU_stay_adapt_bool = (EU_adapt > EU_do_nothing) & (EU_adapt >= EU_migr_MAX)
@@ -1101,7 +981,7 @@ class CoastalNode(HouseholdBaseClass, CoastalNodeProperties):
                 # Check for missing data
                 assert (self.adapt != -1).any()
                 self.percentage_adapted = round(np.sum(self.adapt)/ len(self.adapt) * 100, 2)
-                self.n_people_adapted = np.sum(self.adapt[self.adapt == 1])
+                self.n_households_adapted = np.sum(self.adapt[self.adapt == 1])
 
                 # Sum bool to get the number of households to move
                 n_households_to_move = np.sum(EU_mig_bool)
@@ -1125,7 +1005,7 @@ class CoastalNode(HouseholdBaseClass, CoastalNodeProperties):
                 # Check for missing data
                 assert (self.adapt != -1).any()
                 self.percentage_adapted = round(np.sum(self.adapt)/ len(self.adapt) * 100, 2)
-                self.n_people_adapted = np.sum(self.adapt[self.adapt == 1])
+                self.n_households_adapted = np.sum(self.adapt[self.adapt == 1])
 
                 n_households_to_move = 0
             
@@ -1205,405 +1085,3 @@ class CoastalNode(HouseholdBaseClass, CoastalNodeProperties):
             "income": person_income,
             "risk_perception": person_risk_perception
         }
-
-class InlandNode(HouseholdBaseClass, InlandNodeProperties):
-    def __init__(self, model, agents, geom, distance_matrix, n_households_per_region, idx, max_household_size):
-        self.model = model
-        self.agents = agents
-        self.geom = geom
-        self.admin_idx = idx
-        self.distance_vector = distance_matrix[idx]
-        self.n_households_per_region = n_households_per_region
-        assert not np.isnan(self.distance_vector).any()
-        self.max_household_size = max_household_size
-
-        data = self.model.data.population.sample_geom(self.geom)
-        data = data.ravel()
-        data = data[data != -1]
-        population = np.round(np.sum(data)) 
-        if np.isnan(population):
-            population = 0
-        self.population = population 
-
-        self.n = self.population // ((max_household_size + 1)/ 2) # Average household size
-        
-        self.size = None # Required for export. Improve later
-        self.income = None
-        self.adapt = None
-        self.risk_perception = None
-        self.ead = None
-        self.flood_timer = None
-        self.income_percentile = np.array([-9999])
-
-        HouseholdBaseClass.__init__(self, model, agents)
-
-
-    def initiate_agents(self):
-        return None
-
-    def add(self, people):
-        # Migration
-        n_households = np.unique(people['household_id']).size
-        self.n_moved_in_last_timestep = n_households
-        self.n += n_households
-        self.population += len(people['to'])
-        
-    def remove(self, n, n_movers):
-        if n > self.n:
-            raise ValueError("Cannot remove more households than present in the area") 
-        if n_movers > self.population:
-            raise ValueError("Cannot remove more people than present in the area")
-        self.n_moved_out_last_timestep = n
-        self.people_moved_out_last_timestep = n_movers
-        self.n -= n
-        self.population -= n_movers
-    
-        
-    def move(self):
-        '''This function moves people from the regional nodes. The gravity model function is called to calculate flow between regions.'''
-        self.n_moved_out_last_timestep = 0
-        self.n_moved_in_last_timestep = 0
-
-        # Include migration or not
-        if (self.settings['general']['include_migration'] or self.model.spin_up_flag) and not self.model.calibrate_flag:
-            # Use gravity model to determine number of households migrating between regions
-            gravity_dictionary = {}
-            # Array to store generated household sizes
-            household_sizes_all = np.array([], dtype=np.int16)
-            n_people_to_move_dict = np.full(len(self.agents.regions.ids), -1, dtype=np.int16)
-            n_people_to_move = 0
-
-            # Itterate over each destination node       
-      
-            # Filter out floodplains
-            # Make sure the array is in the correct order
-            assert self.agents.regions.ids[-1].endswith('_flood_plain')
-
-            # Filter
-            destinations = [region for region in self.agents.regions.ids if not region.endswith('_flood_plain')]
-
-            # Load social connectedness and filter admin
-            for i, destination in enumerate(destinations):
-                population_flood_plain_dest = 0
-                dest_flood_plain = destination + '_flood_plain'
-
-                household_sizes = np.array([])
-                # Flows within the region are set to zero
-                if i == self.admin_idx:
-                    flow_people = 0
-                    gravity_dictionary[i] = flow_people             
-                    n_people_to_move_dict[i] = 0
-                else:
-                    flood_dest = False
-                    if dest_flood_plain in self.agents.regions.ids:
-                        flood_dest = True
-                        dest_flood_plain_idx = self.agents.regions.ids.index(dest_flood_plain)
-                        population_flood_plain_dest = self.agents.regions.population[dest_flood_plain_idx]
-
-                    pop_i = self.population
-                    pop_j = self.agents.regions.population[i] + population_flood_plain_dest
-                    inc_i = self.income_region
-                    inc_j = self.agents.regions.income_region[i]
-                    
-                    if any(self.model.data.coastal_admins[0] == self.admin_name):
-                        coastal_i = 1
-                    else:
-                        coastal_i = 0
-                    
-                    if (any(destination == self.model.data.coastal_admins[0])):
-                        coastal_j = 1
-                    else:
-                        coastal_j = 0
-
-                    # convert distance to kilometers
-                    distance = self.distance_vector[i]
-                  
-                    # apply gravity model to calculate people flow
-                    flow_people = gravity_model(pop_i=pop_i, pop_j=pop_j,
-                     inc_i=inc_i, inc_j=inc_j, coastal_i=coastal_i, coastal_j=coastal_j,
-                     distance=distance)
-                    
-
-                    floodplain_flow = 0
-                    inland_flow = flow_people
-
-                    if flood_dest:
-                        # Now determine the number of people moving to the department that has a floodplain and distribute based on populations
-                        # frac of population living in floodplain
-                        frac_pop = population_flood_plain_dest/ self.agents.regions.population[i]
-                        
-                        # flow towards the floodplain 
-                        floodplain_flow = round(frac_pop * flow_people)
-
-                        # flow towards inland portion 
-                        inland_flow = flow_people - floodplain_flow
-                        
-
-                        n_people_to_move_dict[dest_flood_plain_idx] = floodplain_flow
-                        
-                        household_sizes = self.return_household_sizes(flow_people=floodplain_flow, max_household_size=self.max_household_size)
-                        household_sizes_all = np.append(household_sizes_all, household_sizes) 
-
-                        gravity_dictionary[dest_flood_plain_idx] = int(len(household_sizes[household_sizes != 0]))
-
-
-                    # Add flow to total nr people moving out
-                    n_people_to_move += flow_people
-                    n_people_to_move_dict[i] = inland_flow
-
-                    household_sizes = self.return_household_sizes(flow_people=inland_flow, max_household_size=self.max_household_size)
-                    
-                    # Store n_households moving out
-                    gravity_dictionary[i] = int(len(household_sizes[household_sizes != 0]))
-                    
-                    # Append to array of all household sizes moving out 
-                    household_sizes_all = np.append(household_sizes_all, household_sizes)         
-            
-                    
-                        
-
-            # Calculate total n households moving out
-            n_households_to_move = len(household_sizes_all)
-
-            # Initiate loop
-            move_to_region_per_household = []
-
-            # Loop to create household destinations
-            for i in gravity_dictionary.keys():
-                move_to_region_per_household = np.append(move_to_region_per_household, np.repeat(i, gravity_dictionary[i]))    
-        
-        
-        else:
-            n_households_to_move = None
-
-        if not n_households_to_move:  # no household are moving
-            return None
-
-        # Create household attributes for move dictionary
-        n_movers, to_region, household_id, gender, risk_aversion, age, income_percentile, income, risk_perception = self._generate_households(
-            n_households_to_move=n_households_to_move,
-            household_sizes=household_sizes_all,
-            move_to_region_per_household = move_to_region_per_household,
-            hh_risk_aversion = self.settings['decisions']['risk_aversion'],
-            init_risk_perception = self.settings['flood_risk_calculations']['risk_perception']['min'],
-            income_percentiles = nb.typed.List(self.model.agents.regions.income_percentiles_regions)
-        )
-        # Remove housheold and people from the population
-        self.remove(n_households_to_move, n_people_to_move)
-
-        # Calculate percentage moved out
-        self.perc_people_moved_out = n_people_to_move / self.population * 100
-
-        person_income_percentile = np.take(income_percentile, household_id)
-        person_risk_perception =  np.take(risk_perception, household_id)
-        person_income = np.take(income, household_id)
-        # Create person level income percentile and risk perception for move dictionary
-
-        # Return move dictionary
-        return {
-            "from": np.full(n_movers, self.admin_idx, dtype=np.int32),
-            "to": to_region,
-            "household_id": household_id,
-            "gender": gender,
-            "risk_aversion": risk_aversion,
-            "age": age,
-            "income_percentile": person_income_percentile,
-            "income": person_income,
-            "risk_perception": person_risk_perception,
-        }
-    
-    def process_population_change(self):
-        population_change, household_sizes = self.ambient_pop_change()
-        self.population += population_change
-        # Reshuffle households based on population change (improve later, although not relevant)
-        self.n = np.int(self.population / (self.max_household_size+1/2))       
-
-
-    def step(self):
-        # pass
-        if self.model.current_time.year > self.model.config['general']['start_time'].year:
-            self.process_population_change()
-
-class Nodes(AgentBaseClass, NodeProperties):
-    # This class contains both the inland nodes (InlandNode) and coastal node (CoastalNode)
-    def __init__(self, model, agents):
-        self.model = model
-        self.agents = agents
-        self.initiate_agents()
-        self._load_initial_state()
-
-    def initiate_agents(self):
-        self.geoms = self.model.area.geoms['admin']
-        self.n = len(self.geoms)
-        self._initiate_attributes()
-
-        max_household_size = 6
-        
-        self.household = {}
-        self.aggregate_household = {}
-        self.all_households = []
-        j = 0
-        n_households_per_region = np.full(len(self.geoms), 0, dtype=np.int32)
-        for i, geom in enumerate(self.geoms):
-            
-            # All nodes
-            ID = geom['properties']['id']
-
-            # Coastal nodes 
-            if ID.endswith('flood_plain') & self.model.config['general']['create_agents']== True:
-                init_folder = os.path.join("DataDrive", "SLR", f"households_gadm_{self.model.args.admin_level}_{self.model.config['general']['start_time'].year}", self.model.config['general']['size'], ID.replace('_flood_plain', ''))
-                locations_fn = os.path.join(init_folder, "locations.npy")
-                if os.path.exists(locations_fn):
-                    redundancy = np.load(locations_fn).size * 100  # redundancy of 1000%
-                else:
-                    redundancy = 0  # nobody should be moving to areas with no population
-                household_class = CoastalNode(
-                    self.model,
-                    self.agents,
-                    idx=i,
-                    geom=geom,
-                    distance_matrix=self.distance_matrix,
-                    n_households_per_region=n_households_per_region,
-                    init_folder=init_folder,
-                    max_household_size=max_household_size,
-                    redundancy=redundancy,
-                    person_reduncancy=int(redundancy * (max_household_size // 2))
-                )
-                self.household[ID] = household_class
-            else:
-
-                household_class = InlandNode(
-                    self.model,
-                    self.agents,
-                    idx=i,
-                    geom=geom,
-                    distance_matrix=self.distance_matrix,
-                    n_households_per_region=n_households_per_region,
-                    max_household_size=max_household_size
-                )
-                j += 1
-                self.aggregate_household[ID] = household_class
-            self.all_households.append(household_class)
-        
-        self.model.logger.info(f'Created {sum(household.n for household in self.household.values())} households')
-        self.model.logger.info(f'Created {sum(household.n for household in self.aggregate_household.values())} aggregrate households')
-        
-
-    def _load_initial_state(self):
-        return None
-
-    def _get_distance_matrix(self):
-        centroids = self.centroids
-        
-        # Convert (back) to geopandas points
-        gpd_points = gpd.points_from_xy(centroids[:,0], centroids[:,1], crs='EPSG:4326')
-
-        # Project points in world Mollweide (?)
-        gpd_points = gpd_points.to_crs('ESRI:54009')
-
-        # Extract x and y   
-        x = gpd_points.x
-        y = gpd_points.y
-
-        # Stack into dataframe and export distance matrix
-        projected_centroids = np.column_stack((x, y))
-        return sdistance_matrix(projected_centroids, projected_centroids) /1000 # Devide by 1000 to derive km
-    
-    def _initiate_attributes(self):
-        self.distance_matrix = self._get_distance_matrix()
-
-    def merge_move_dictionary(self, move_dictionaries):
-        merged_move_dictionary = {}
-        for key in move_dictionaries[0].keys():
-            # Household_ids are determined in the origin region. The procedure below ensures that
-            # all household_ids are unique across the merged dictionary.
-            if key == 'household_id':
-                c = 0
-                household_ids_per_region = [d[key] for d in move_dictionaries]
-                household_ids_per_region_corrected = []
-                for household_ids in household_ids_per_region:
-                    if household_ids.size > 0:
-                        household_ids_per_region_corrected.append(household_ids + c)
-                        c += household_ids[-1] + 1
-                merged_move_dictionary[key] = np.hstack(household_ids_per_region_corrected)
-                self.model.logger.info(f"Moving {len(merged_move_dictionary[key])} agents")
-            else:
-                merged_move_dictionary[key] = np.hstack([d[key] for d in move_dictionaries])
-        return merged_move_dictionary
-
-    def step(self):
-        for households in self.all_households:
-            households.step()
-            
-        move_dictionaries = []
-        for region in self.all_households:
-            move_dictionary = region.move()
-
-            if move_dictionary:
-                move_dictionaries.append(move_dictionary)
-        if move_dictionaries:
-            # merge movement data of different regions in 1 dictionary
-            merged_move_dictionary = self.merge_move_dictionary(move_dictionaries)
-            if households.settings['general']['export_move_dictionary']:
-                merged_pd = pd.DataFrame(merged_move_dictionary)#.to_csv(os.path.join(self.model.config['general']['report_folder'], f'move_dictionary_{self.model.current_time.year}.csv'))
-                
-                unique_household_ids = merged_pd.groupby('household_id').mean().drop(columns = ['gender', 'age'])     
-
-                fn = os.path.join(self.model.config['general']['report_folder'], 'move_dictionaries')
-                if not os.path.exists(fn):
-                    os.makedirs(fn)
-                
-                from_region = [self.model.agents.regions.ids[int(i)] for i in unique_household_ids['from']]
-                to_region = [self.model.agents.regions.ids[int(i)] for i in unique_household_ids['to']]
-                unique_household_ids['from'] = from_region
-                unique_household_ids['to'] = to_region
-                coastal = [coast_key for coast_key in list(unique_household_ids['from']) if coast_key.endswith('flood_plain')]
-                unique_household_ids_filt = unique_household_ids[unique_household_ids['from'].isin(coastal)]
-                unique_household_ids_filt.to_csv(os.path.join(fn, f'move_dictionary_housholds_{self.model.current_time.year}.csv'))
-
-            # split the movement data by destination region and send data to region
-
-            sort_idx = np.argsort(merged_move_dictionary['to'], kind='stable')
-            for key, value in merged_move_dictionary.items():
-                merged_move_dictionary[key] = value[sort_idx]
-            move_to_regions, start_indices = np.unique(merged_move_dictionary['to'], return_index=True)
-            end_indices = np.append(start_indices[1:], merged_move_dictionary['to'].size)
-       
-            for region_idx, start_idx, end_idx in zip(move_to_regions, start_indices, end_indices):
-                move_data_per_region = {
-                    key: value[start_idx: end_idx]
-                    for key, value in merged_move_dictionary.items()
-                }
-
-                self.all_households[region_idx].add(move_data_per_region)   
-       
-        # Export all agents to csv
-        if households.settings['general']['export_agents']:
-            export_agents(agent_locs = self.agents.regions.agent_locations, agent_size = self.agents.regions.household_sizes,
-                agent_adapt = self.agents.regions.household_adapted, agent_income=self.agents.regions.household_incomes,
-                agent_risk_perception = self.agents.regions.household_risk_perception, agent_ead=self.agents.regions.household_ead,
-                agent_since_flood = self.agents.regions.since_flood,
-                year = self.model.current_time.year, 
-                export = True,
-                report_folder=self.model.config['general']['report_folder'])   
-
-
-        if households.settings['general']['export_matrix'] and move_dictionaries:
-            # Export matrix to csv
-            export_folder = os.path.join(self.model.config['general']['report_folder'], 'migration_matrices')
-            export_matrix(geoms = self.model.agents.regions.geoms, 
-                        dest_folder=export_folder, 
-                        move_dictionary=merged_move_dictionary,
-                        year=self.model.current_time.year)
-
-class Agents:
-    def __init__(self, model):
-        self.model = model
-        self.agent_types = []
-        self.regions = Nodes(model, self)
-    def step(self):     
-        self.regions.step()
-        if not self.model.spin_up_flag or not self.model.args.headless:
-            self.population_data = WorldPopProspectsChange(initial_figures=self.model.data.nat_pop_change,
-             HistWorldPopChange = self.model.data.HistWorldPopChange, WorldPopChange = self.model.data.WorldPopChange, 
-             population=self.regions.population, admin_keys=self.regions.ids, year = self.model.current_time.year)

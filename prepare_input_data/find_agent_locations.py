@@ -1,9 +1,5 @@
-'''This script is used to generate the agent population using gridded population data. It must be run to create the 
-geofiles required to run the model.'''
-
 import geopandas as gpd
 from osgeo import gdal, ogr
-# from hyve.library.raster import rasterize
 import rasterio
 import rasterio.mask
 import rasterio.transform
@@ -11,11 +7,14 @@ import os
 from numba import njit
 import subprocess
 import numpy as np
-from shapely.ops import cascaded_union
 from shapely.ops import unary_union
 from osgeo import osr
 
 from random import randint
+
+YEAR = 2015
+GDAL_POLYGONIZE = r"C:\Users\ltf200\Anaconda3\envs\abm\Scripts\gdal_polygonize.py" # adjust to user
+assert os.path.exists(GDAL_POLYGONIZE)
 
 def rasterize(input_fn, output_fn, xsize, ysize, projection, gt, attribute, nodatavalue, dtype):
     shp = ogr.Open(input_fn)
@@ -27,7 +26,7 @@ def rasterize(input_fn, output_fn, xsize, ysize, projection, gt, attribute, noda
         ysize,
         1,
         dtype,
-        options=['COMPRESS=NONE'] # number of GADM-2 areas exceeds maximum possible under int16 
+        options=['COMPRESS=LZW'] # number of GADM-2 areas exceeds maximum possible under int16 
     )
 
     if isinstance(projection, int):
@@ -46,15 +45,36 @@ def rasterize(input_fn, output_fn, xsize, ysize, projection, gt, attribute, noda
     output = None
     shp = None
 
-
-
-
-
-LEVEL = 2
-YEAR = 2015
-
 @njit
-def generate_locations(population, gadm, can_flood, x_offset, y_offset, x_step, y_step, max_household_size):
+def generate_locations(
+    population: np.ndarray, 
+    gadm: np.ndarray, 
+    can_flood: np.ndarray, 
+    x_offset: float, 
+    y_offset: float, 
+    x_step: float, 
+    y_step: float, 
+    max_household_size: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+
+    '''This function is used to create the locations of the household agent and household sizes. It generates households by sampling from the gridded population map using random household sizes.
+    
+    Args:
+        population: array constructed from gridded population data.
+        gadm: array representing a global raster. Admin unit are rasterized, so that each cell value represents an admin unit.
+        can_flood: array representing a global raster. It is a boolean contructed using the 1/100 year flood map of 2080. 1 = inundated, 0 = not inundated.
+        x_offset: geotransformation
+        y_offset: geotransformation
+        x_step: x-dimension of cell size in degrees
+        y_step: y-dimension of cell size in degrees
+        max_household_size: the maximimum household size used in sampling household agents. 
+
+    Returns:
+        household_locations: array containing coordinates of each generated household.
+        household_sizes: array containing the household size of each generated household.
+        household_admin: array containing the value of the rasterized admin unit the household resides in.
+
+    '''
 
     household_locations = np.full((population.sum(), 2), -1, dtype=np.float32)
     household_sizes = np.full(population.sum(), -1, dtype=np.int32)
@@ -92,7 +112,24 @@ def generate_locations(population, gadm, can_flood, x_offset, y_offset, x_step, 
 
 
 @njit
-def create_people(max_household_size, household_size_region):
+def create_people(
+    max_household_size: int, 
+    household_size_region: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+
+    '''This function is used to generate the people that populate the households. It also generates certain individual characteristics (gender and age).
+    
+    Args:
+        max_household_size: the maximum household size.
+        household_size_region: an array containing the household sizes of households in the region (coastal node)
+    
+    Returns:
+        indices: person indices. These indices track the household to which person is a part of (see coastal_node docs).
+        gender: array containing the gender of each person (1 or 0).
+        age: array containing the age of each person.
+    '''
+
+
     indices = np.full((household_size_region.size, max_household_size), -1, dtype=np.int32)
     people_index = 0
     for i in range(household_size_region.size):
@@ -110,41 +147,21 @@ def create_people(max_household_size, household_size_region):
     return indices, gender, age
 
 
-def main(max_household_size):
-    # if location == 'bangladesh':
-    #     countries_iso3 = ["BGD"]
-    # elif location == 'se-asia':
-    #     countries_iso3 = ["BGD", 'THA', 'MMR']
-    # elif location == 'global':
-    #     countries_iso3 = None
-    # else:
-    #     raise NotImplementedError
+def main(level, max_household_size):
 
-    agent_folder = f'DataDrive\SLR\households_gadm_{LEVEL}_{YEAR}'
+    agent_folder = f'DataDrive\SLR\households_gadm_{level}_{YEAR}'
     try:
         os.makedirs(agent_folder)
     except OSError:
         pass
         
-    # area_fn = f'DataDrive/SLR/admin/area_{location}_{LEVEL}.shp'
-    # if not os.path.exists(area_fn):
-    #     gadm_path = f'DataDrive/SLR/GADM/GADM_{LEVEL}.shp'
-    #     area = gpd.GeoDataFrame.from_file(gadm_path)
-    #     if countries_iso3:
-    #         area = area[area['GID_0'].isin(countries_iso3)].reset_index(drop=True)
-    #         boundary = gpd.GeoDataFrame([[f'{location}', area.geometry.unary_union]], columns=['id', 'geometry'], crs=area.crs)
-    #         boundary.to_file(f'DataDrive/SLR/admin/{location}_boundary.shp')
-        
-    #     can_flood_shp = gpd.GeoDataFrame.from_file('DataDrive/SLR/admin/can_flood_gadm_1_merged.shp')
-        
-    #     area.to_file(area_fn)
 
     population_path = f'DataDrive/POPULATION/GHS_POP_{YEAR}.tif'
     with rasterio.open(population_path) as src:
         population = src.read(1).astype(np.int16)
         transform = src.transform
         
-    with rasterio.open(f'DataDrive/SLR/GADM/GADM_{LEVEL}.tif') as gadm_src:
+    with rasterio.open(f'DataDrive/SLR/GADM/GADM_{level}.tif') as gadm_src:
         gadm_profile = gadm_src.profile
         gadm = gadm_src.read(1)
         transform = gadm_src.transform
@@ -159,7 +176,7 @@ def main(max_household_size):
     gadm_max = np.max(gadm)
     can_flood_gadm = gadm.copy()
     can_flood_gadm[can_flood == True] += gadm_max
-    with rasterio.open(f'DataDrive/SLR/can_flood_gadm_{LEVEL}.tif', 'w', **gadm_profile) as dst:
+    with rasterio.open(f'DataDrive/SLR/can_flood_gadm_{level}.tif', 'w', **gadm_profile) as dst:
         dst.write(can_flood_gadm, 1)
 
     population = population.astype(np.int64)
@@ -175,8 +192,8 @@ def main(max_household_size):
     
     household_locations, household_size, household_admin = generate_locations(population, gadm, can_flood, x_offset, y_offset, x_step, y_step, max_household_size)
 
-    gdf = gpd.GeoDataFrame.from_file(f'DataDrive/SLR/GADM/GADM_{LEVEL}.shp')
-    ID = gdf[f'GID_{LEVEL}'].to_numpy().astype("str")
+    gdf = gpd.GeoDataFrame.from_file(f'DataDrive/SLR/GADM/GADM_{level}.shp')
+    ID = gdf[f'GID_{level}'].to_numpy().astype("str")
 
     idx = np.argsort(household_admin)
     household_admin = household_admin[idx]
@@ -209,41 +226,44 @@ def main(max_household_size):
             np.save(os.path.join(subfolder, 'gender.npy'), gender)
             np.save(os.path.join(subfolder, 'age.npy'), age)
 
-def create_admin_tifs():
+def create_admin_tifs(level, iso3=None):
+    '''This function rasterizes the admin tiffs. This is required to later overlay them with the floodmap to derive where coastal nodes and households should be generated.'''
+    
     try:
         os.makedirs('DataDrive/SLR/GADM')
     except OSError:
         pass
-    for LEVEL in [1, 2]:
-        print(LEVEL)
-        output_shp = f'DataDrive/SLR/GADM/GADM_{LEVEL}.shp'
-        output_tif = f'DataDrive/SLR/GADM/GADM_{LEVEL}.tif'
-        population_fn = f'DataDrive/POPULATION/GHS_POP_{YEAR}.tif'
-        if not os.path.exists(output_tif):
-            if not os.path.exists(output_shp):
-                gdf = gpd.GeoDataFrame.from_file(f'DataDrive/GADM/gadm36_{LEVEL}.shp')
-                gdf = gdf[gdf['GID_0'] == 'FRA'] # Only select France
-                gdf = gdf.reset_index()
-                gdf['ID'] = gdf.index
-                gdf.to_file(output_shp)
-            with rasterio.open(population_fn) as src:
-                rasterize(
-                    output_shp,
-                    output_tif,
-                    src.width,
-                    src.height,
-                    4326,
-                    src.transform.to_gdal(),
-                    'id',
-                    -1,
-                    gdal.GDT_Int32
-                )
+    output_shp = f'DataDrive/SLR/GADM/GADM_{level}.shp'
+    output_tif = f'DataDrive/SLR/GADM/GADM_{level}.tif'
+    population_fn = f'DataDrive/POPULATION/GHS_POP_{YEAR}.tif'
+    if not os.path.exists(output_tif):
+        if not os.path.exists(output_shp):
+            gdf = gpd.GeoDataFrame.from_file(f'DataDrive/GADM/gadm36_{level}.shp')
+            if iso3 != None:
+                gdf = gdf[gdf['GID_0'] == iso3]
+            gdf = gdf.reset_index()
+            gdf['ID'] = gdf.index
+            gdf.to_file(output_shp)
+        with rasterio.open(population_fn) as src:
+            rasterize(
+                output_shp,
+                output_tif,
+                src.width,
+                src.height,
+                4326,
+                src.transform.to_gdal(),
+                'id',
+                -1,
+                gdal.GDT_Int32
+            )
 
 
-def create_shapefiles():
-    tif_file = f'DataDrive/SLR/admin/can_flood_gadm_{LEVEL}.tif'
+def create_shapefiles(level):
+    '''This function generates the shapefiles of the inland nodes and coastal nodes.'''
+
+    tif_file = f'DataDrive/SLR/admin/can_flood_gadm_{level}.tif'
     if not os.path.exists(tif_file):
-        with rasterio.open(f'DataDrive/SLR/GADM/GADM_{LEVEL}.tif') as gadm_src:
+        with rasterio.open(f'DataDrive/SLR/GADM/GADM_{level}.tif') as gadm_src:
             gadm_profile = gadm_src.profile
             gadm = gadm_src.read(1)
             gadm_max = np.max(gadm)
@@ -261,42 +281,43 @@ def create_shapefiles():
 
     shp_file = tif_file.replace('.tif', '.shp')
     if not os.path.exists(shp_file):
-        subprocess.call(
-            r"python  C:\Users\ltf200\Anaconda3\envs\abm\Scripts\gdal_polygonize.py" + f" {tif_file} {shp_file}",
+        out = subprocess.call(
+            f"python {GDAL_POLYGONIZE} {tif_file} {shp_file}",
             shell=True
         )
+        assert out == 0
+        assert os.path.exists(shp_file)
 
-    IDs = gpd.GeoDataFrame.from_file(f'DataDrive/SLR/GADM/GADM_{LEVEL}.shp')[f'GID_{LEVEL}'].to_numpy().astype(str)
-    n_IDs = IDs.size - 1
-    
-    gdf = gpd.GeoDataFrame.from_file(shp_file)
-    ids, geoms, keys = [], [], []
-    grouped_by_DN = gdf.groupby(by='DN')
-    for DN, geometries in grouped_by_DN:
-        if any(geometries.is_valid) == False:
+    merged_filename = shp_file.replace('.shp', '_merged.shp')
+    if not os.path.exists(merged_filename):
+        IDs = gpd.GeoDataFrame.from_file(f'DataDrive/SLR/GADM/GADM_{level}.shp')[f'GID_{level}'].to_numpy().astype(str)
+        n_IDs = IDs.size - 1
+        
+        gdf = gpd.GeoDataFrame.from_file(shp_file)
+        ids, geoms, keys = [], [], []
+        grouped_by_DN = gdf.groupby(by='DN')
+        for DN, geometries in grouped_by_DN:
+            if any(geometries.is_valid) == False:
+                geometries = geometries.buffer(0)
+                geoms.append(unary_union(geometries.geometry))
+                geoms.append(unary_union(geometries['geometry']))
+        
             geometries = geometries.buffer(0)
             geoms.append(unary_union(geometries.geometry))
-            geoms.append(unary_union(geometries['geometry']))
-       
-        # geometries = geometries.buffer(0)
-        # geoms.append(unary_union(geometries.geometry))
 
-        ids.append(DN)
-        if DN > n_IDs:
-            keys.append(f"{IDs[DN-n_IDs]}_flood_plain")
-        else:
-            keys.append(IDs[DN])
+            ids.append(DN)
+            if DN > n_IDs:
+                keys.append(f"{IDs[DN-n_IDs]}_flood_plain")
+            else:
+                keys.append(IDs[DN])
 
-        
-       
-    
-    gdf_out = gpd.GeoDataFrame({'ID': ids, 'keys': keys, 'geometry': geoms}, crs="EPSG:4326")
-    gdf_out.to_file(shp_file.replace('.shp', '_merged.shp'))
+        gdf_out = gpd.GeoDataFrame({'ID': ids, 'keys': keys, 'geometry': geoms}, crs="EPSG:4326")
+        gdf_out.to_file(merged_filename)
 
 if __name__ == '__main__':
-    create_admin_tifs()
-    # create_shapefiles()
-    # main(max_household_size=10)
-    # main('bangladesh')
-    # main('global')
+    level = 2
+    create_admin_tifs(level = level)  # Optional iso3 argument to generate agents for a specific country
+    create_shapefiles(level)
+    main(level, max_household_size=6)
+
     

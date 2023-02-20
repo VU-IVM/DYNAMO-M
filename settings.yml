@@ -1,0 +1,55 @@
+general:
+  export_agents: false
+  export_matrix: false
+  export_move_dictionary: false
+  flood:
+    spin_up_flood: true
+    random_flood: true
+    year: 2016
+    rt: 100
+    flood_protection_standard: 10
+  include_migration: true
+  include_adaptation: true
+  include_ambient_pop_change: true
+  dynamic_behavior: true
+
+shoreline_change:
+  include_erosion: true # set to false to exclude erosion from analysis (erosion rate remains static over time)
+  max_sandy_beach_value: 0 # set to zero for no added value of sandy beach
+
+flood_risk_calculations:
+  flood_protection_standard: 10
+  property_value: 77_563
+  risk_perception:
+    base: 1.6
+    min: 0.01 #0.01
+    max: 2
+    coef: -3.6
+
+adaptation:
+  mean_median_inc_ratio: 1.15
+  expenditure_cap: 0.06
+  loan_duration: 16
+  interest_rate: 0.04
+  adaptation_cost: 10_800
+  lifespan_dryproof: 75
+
+decisions:
+  regions_included_in_migr: 122 #122
+  risk_aversion: 1
+  decision_horizon: 15
+  time_discounting: 0.032
+  migration:
+    cells_to_assess: 20
+    intention_to_behavior: .12 # in fractions
+    max_cost: 500_000 # * 0.5 is min cost at dist=0 # set at 500_000 in orig paper
+    cost_shape: 0.05
+    amenity_weight: 0.5
+
+gravity_model:
+  inlcude_location_effects: false
+  annual_international_migration: 0
+
+calibrate:
+  parameter_ranges: parameter_ranges.csv
+  observed: observed.csv

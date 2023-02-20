@@ -1,0 +1,5 @@
+Parameter,MinValue,MaxValue,Step,Use
+max_risk_perception,1,7,1,TRUE
+expenditure_cap,0.02,0.11,0.01,TRUE
+loan_duration,10,31,2,TRUE
+interest_rate,0.01,0.06,0.01,TRUE

@@ -1,0 +1,114 @@
+general:
+  create_agents: true
+  size: xxlarge
+  start_time: 2015-01-01T00:00:00
+  end_time: 2081-01-01T00:00:00
+  report_folder: report
+  spin_up_time: 15
+  
+logging:
+  logfile: slr.log  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  loglevel: DEBUG
+
+draw:
+  draw_geography:
+    admin:
+      color: "#000000"
+      filled: false
+  draw_agents:
+    regions.household: 
+      area: true 
+      draw_every_nth: 10
+    regions.aggregate_household:
+      area: true
+
+report:
+  population:
+    type: regions
+    varname: population
+    scale: global
+    function: null
+    split: True
+    save: save
+    format: csv
+  
+  agents_in_simulation:
+    type: regions
+    varname: agents_in_simulation
+    scale: global
+    function: null
+    split: True
+    save: save
+    format: csv
+  
+  percentage_adapted:
+    type: regions
+    varname: percentage_adapted
+    scale: global
+    function: null
+    split: True
+    save: save
+    format: csv
+
+  ead_total:
+    type: regions
+    varname: ead_total
+    scale: global
+    function: null
+    split: True
+    save: save
+    format: csv
+
+  average_household_income:
+    type: regions
+    varname: average_household_income
+    scale: global
+    function: null
+    split: True
+    save: save
+    format: csv
+
+  people_near_beach:
+    type: regions
+    varname: people_near_beach
+    scale: global
+    function: null
+    split: True
+    save: save
+    format: csv
+
+  beach_dict:
+    type: beaches
+    varname: beach_dict
+    scale: global
+    function: null 
+    split: False
+    save: save
+    format: npy
+
+  n_households_adapted:
+    type: regions
+    varname: n_households_adapted
+    scale: global
+    function: null
+    split: True
+    save: save
+    format: csv
+
+  flood_tracker:
+    type: regions
+    varname: flood_tracker
+    scale: global
+    function: null
+    split: True
+    save: save
+    format: csv
+
+  total_shoreline_change_admin:
+    type: regions
+    varname: total_shoreline_change_admin
+    scale: global
+    function: null
+    split: True
+    save: save
+    format: csv
