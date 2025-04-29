@@ -1,0 +1,11 @@
+gravity_model_OLS:
+  age_i: 0.0
+  age_j: 0.0
+  coastal_i: 0
+  coastal_j: 0
+  distance: -0.741845802
+  income_i: 0
+  income_j: 0
+  intercept: -13.46122719
+  population_i: 0.8297920197939301
+  population_j: 0.7843957102525148
