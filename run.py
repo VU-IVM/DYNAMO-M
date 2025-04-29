@@ -1,182 +1,95 @@
+from model import SLRModel
+from honeybees.visualization.canvas import Canvas
+from honeybees.visualization.modules import ChartModule
+from honeybees.visualization.ModularVisualization import ModularServer
 import os
 import numpy as np
-import rasterio
-import pickle
-
 import faulthandler
+from utils.parse_arguments import parse_arguments
+from utils.get_study_area import get_study_area
+from utils.wrappers import run_with_profiling
 faulthandler.enable()
 np.seterr(all='raise')
 
-from honeybees.visualization.ModularVisualization import ModularServer
-from honeybees.visualization.modules import ChartModule
-from honeybees.visualization.canvas import Canvas
-from honeybees.argparse import parser
-    
-from model import SLRModel
-
-def get_study_area(area, admin_level, coastal_only=False):
-    if isinstance(area, list):
-        area_name = "+".join(area)
-    else:
-        area_name = area
-    path = f'cache/study_area_{area_name}_{admin_level}{"_coastal_only" if coastal_only else ""}.pickle'
-
-    if not os.path.exists(path):
-        import geopandas as gpd
-        from shapely.geometry import mapping
-        try:
-            os.makedirs('cache')
-        except OSError:
-            pass
-
-        # Load administrative shapefiles
-        admin_path = f'DataDrive/SLR/admin/can_flood_gadm_{admin_level}_merged.shp'
-        if not os.path.exists(admin_path):
-            raise FileNotFoundError("Run find_agent_locations.py first")
-        admins = gpd.GeoDataFrame.from_file(admin_path)
-        
-        # Load GADM areas
-        with rasterio.open(f'DataDrive/SLR/admin/can_flood_gadm_{admin_level}.tif', 'r') as src:
-            gadm = src.read(1)
-            gt = src.transform.to_gdal()
-
-        # Create empty study area dictionary
-        study_area = {"name": area_name}
-
-        if isinstance(area, str):
-            # Select ISO3 codes based on study area name and set bounding box based on area
-            if area == 'benelux':
-                iso3 = ["BEL", "NLD", "LUX"]
-            elif area == 'se-asia':
-                iso3 = ["BGD", 'THA', 'MMR']
-            elif area == 'global':
-                iso3 = None
-            else:
-                raise ValueError(f"{area} not recognized")
-        elif isinstance(area, list):
-            iso3 = area
-        else:
-            raise ValueError("area must be either list or string")
-
-        if iso3:
-            admins = admins[admins['keys'].apply(lambda x: x[:3] in iso3)]
-
-        if coastal_only:
-            admins = admins[admins['keys'].apply(lambda x: x.endswith('flood_plain'))]
-
-        xmin, ymin, xmax, ymax = 180, 90, -180, -90
-        admin_list = []
-        # neighbors = {}
-        n = len(admins)
-        for i, (_, admin) in enumerate(admins.iterrows(), start=1):
-            print(f"{i}/{n}")
-
-            gxmin, gymin, gxmax, gymax = admin.geometry.bounds
-            xmin = min(xmin, gxmin)
-            ymin = min(ymin, gymin)
-            xmax = max(xmax, gxmax)
-            ymax = max(ymax, gymax)
-
-            centroid = admin.geometry.centroid
-            feature = {
-                'geometry': admin.geometry.__geo_interface__,
-                # 'geometry': vw.simplify_geometry(admin.geometry.__geo_interface__, ratio=0.03),
-                'properties': {
-                    'id': admin['keys'],
-                    'gadm': {
-                        'indices': np.where(gadm == admin['ID']),
-                        'gt': gt
-                    },
-                    'centroid': (centroid.x, centroid.y),
-                }
-            }
-            admin_list.append(feature)
-            # neighbors = admin[admin.geometry.touches(country.geometry)].index.tolist()
-            # feature['properties']['neighbors'] = neighbors
-
-
-        study_area["admin"] = admin_list
-        
-        study_area["xmin"] = xmin - gt[1]
-        study_area["ymin"] = ymin + gt[5]
-        study_area["xmax"] = xmax + gt[1]
-        study_area["ymax"] = ymax - gt[5]
-
-        with open(path, 'wb') as f:
-            pickle.dump(study_area, f)
-    else:
-        print('loading study area from cache')
-        with open(path, 'rb') as f:
-            study_area = pickle.load(f)
-    return study_area
 
 if __name__ == '__main__':
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--area', dest='area', type=str)
-    group.add_argument('--iso3', dest='area', nargs="+", type=str)
-    parser.add_argument('--profiling', dest='profiling', default=False, action='store_true')
-    parser.add_argument('--admin_level', dest='admin_level', type=int, default=1)
-    parser.add_argument('--iterations', dest='iterations', type=int, default=1, help="choose the number of model iterations")
-    parser.add_argument('--rcp', dest='rcp', type=str, default='rcp4p5', help=f"choose between control, rcp4p5 and rcp8p5")
-    parser.add_argument('--ssp', dest='ssp', type=str, default='worldpop', help='Choose SSP1-5 or coupled RCP-SSP (coupled), or worldpop')
-    parser.add_argument('--coastal-only', dest='coastal_only', action='store_true', help=f"only run the coastal areas")
-    parser.add_argument('--config', dest='config', type=str, default='config.yml', help='Choose to config file for the model run.')
-    parser.add_argument('--settings', dest='settings', type=str, default='settings.yml', help='Choose to settings file for the model run.')
+    # parse arguments
+    args = parse_arguments()
+    
+    # get study area (or create if not in cache)
+    study_area = get_study_area(area=args.area, subdivision=args.subdivision, admin_level=args.admin_level, coastal_only=args.coastal_only)
 
-    parser.set_defaults(headless=True)
-
-    args = parser.parse_args()
-
-    study_area = get_study_area(args.area, args.admin_level, args.coastal_only)
-
+    # set some globals
     CONFIG_PATH = args.config
     SETTINGS_PATH = args.settings
-
     MODEL_NAME = 'SLR'
 
+    # set model params
     model_params = {
         "config_path": CONFIG_PATH,
         "settings_path": SETTINGS_PATH,
         "args": args,
         "study_area": study_area,
     }
-    if args.headless:
-        if args.profiling == True:
-            print("Run with profiling")
-            model = SLRModel(**model_params)
-            import cProfile
-            import pstats
-            with cProfile.Profile() as pr:
-                model.run()
-            
-            with open('profiling_stats.cprof', 'w') as stream:
-                stats = pstats.Stats(pr, stream=stream)
-                stats.strip_dirs()
-                stats.sort_stats('cumtime')
-                stats.dump_stats('.prof_stats')
-                stats.print_stats()
-            pr.dump_stats('profile.prof')    
+
+    # if not running with GUI...
+    if not args.GUI:
         
+        # check if model is ran from spinup period
+        if args.run_from_cache:
+            if type(args.area) == list: area_name = "+".join(args.area)
+            else: area_name = args.area
+            path = os.path.join(args.low_memory_mode_folder, 'spin_up', f'model_{area_name}_{args.admin_level}.pkl')
 
-        else:
+            if os.path.exists(path):
+                print('Model loaded from cache')
+                model = SLRModel.run_from_spinup(args)
+                model.report()
+            else:
+                print(f'Model not found in {path}')
+                model = SLRModel(**model_params)
+                model.spin_up_and_store_model() 
+                del model
+                model = SLRModel.run_from_spinup(args)
+                model.report()
+        
+        # if complete model is run check if run with profiling
+        else: 
             model = SLRModel(**model_params)
-            model.run()
-            report = model.report()
+            if args.profiling:            
+                run_with_profiling(model)
+            else:
+                model.run()
+                model.report()
 
+    # if run with GUI create GUI and plots
     else:
         series_to_plot = [
+            # [
+            #     {"name": "ead_nodes",
+            #      "ID": f"{admin['properties']['id']}"}
+            #     for admin in study_area['admin'] if admin['properties']['id'].endswith('_flood_plain')
+            # ],
+
+            # [
+            #     {"name": "population",
+            #      "ID": f"{admin['properties']['id']}"}
+            #     for admin in study_area['admin'] if admin['properties']['id'].endswith('_flood_plain')
+            # ],
+
             [
-                {"name": "ead_total",
-                "ID": f"{admin['properties']['id']}"}
+                {"name": "percentage_adapted",
+                 "ID": f"{admin['properties']['id']}"}
                 for admin in study_area['admin'] if admin['properties']['id'].endswith('_flood_plain')
             ],
 
             [
-                {"name": "n_moved_out_last_timestep",
-                "ID": f"{admin['properties']['id']}"}
+                {"name": "n_households_insured",
+                 "ID": f"{admin['properties']['id']}"}
                 for admin in study_area['admin'] if admin['properties']['id'].endswith('_flood_plain')
             ],
-           
+
+
         ]
         server_elements = [
             Canvas(max_canvas_height=800, max_canvas_width=1200)
@@ -188,5 +101,11 @@ if __name__ == '__main__':
             'century'
         ]
 
-        server = ModularServer(MODEL_NAME, SLRModel, server_elements, DISPLAY_TIMESTEPS, model_params=model_params, port=None)
+        server = ModularServer(
+            MODEL_NAME,
+            SLRModel,
+            server_elements,
+            DISPLAY_TIMESTEPS,
+            model_params=model_params,
+            port=None)
         server.launch(port=args.port, browser=args.browser)

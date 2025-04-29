@@ -1,53 +1,41 @@
 from agents.nodes import Nodes
-from agents.government import Government
+from agents.beach_manager import BeachManager
 from agents.beaches import Beaches
-from scipy.spatial import distance_matrix as sdistance_matrix
-from agents.node_properties import NodeProperties
-from population_change import WorldPopProspectsChange
-from population_change import SSP_population_change
+from agents.government_agent import GovernmentAgent
+from agents.insurer_agent import InsurerAgent
+from population_change import PopulationChange
+from GDP_change import GDP_change
+from decision_module import DecisionModule
 
 class Agents:
+    '''This class contains all the agents (nodes (households), beaches, and governments) in the model. It is used to initiate the agents and to call the step function of each agent class.'''
+
     def __init__(self, model):
         self.model = model
-        self.agent_types = ['regions', 'beaches', 'government']  # not sure where this is used
+        self.agent_types = ['government', 'regions', 'beaches', 'beach_manager']
         self.regions = Nodes(model, self)
         self.beaches = Beaches(model, self)
-        self.government = Government(model, self)
+        self.beach_manager = BeachManager(
+            model=model, agents=self, beaches=self.beaches)
+        self.population_change = PopulationChange(
+            model=self.model, agents=self)
+        self.GDP_change = GDP_change(
+            model=self.model, agents=self)
+        self.decision_module = DecisionModule(model=model, agents=self)
+        self.decision_module.load_gravity_models() 
+        self.government = GovernmentAgent(
+            model=model, agents=self)
+        self.insurer = InsurerAgent(model=model,
+            agents=self)
 
-    def step(self):     
+    def step(self):
+        if self.model.settings['general']['include_ambient_pop_change']:
+            self.population_change.step()
+        if (not self.model.spin_up_flag or self.model.args.GUI):
+            self.GDP_change.step()
+
         self.beaches.step()
         self.regions.step()
-        self.government.step()
+        self.beach_manager.step()
+        # self.get_attibute_sizes()
 
-        if not self.model.spin_up_flag or not self.model.args.headless:
-            # Quick fix 
-            if self.model.args.ssp == 'coupled':
-                if self.model.args.rcp == 'rcp4p5':
-                    ssp = 'SSP2'
-                elif self.model.args.rcp == 'rcp8p5':
-                    ssp = 'SSP5'
-                elif self.model.args.rcp == 'control':
-                    ssp = 'SSP2'
-                else:
-                    raise NotImplementedError('Scenario not selected?')
-            else:
-                ssp = self.model.args.ssp
-
-            if self.model.current_time.year > 2015 and ssp != 'worldpop':
-                self.population_data = SSP_population_change(
-                    initial_figures=self.model.data.nat_pop_change,
-                    SSP_projections = self.model.data.SSP_projections,
-                    SSP = ssp,
-                    iso3 = self.model.args.area[0], # Not yet working with multiple isocodes. FIX THIS LATER.
-                    population=self.regions.population,
-                    admin_keys=self.regions.ids,
-                    current_year = self.model.current_time.year
-                    )
-            else:
-                self.population_data = WorldPopProspectsChange(
-                    initial_figures = self.model.data.nat_pop_change, 
-                    HistWorldPopChange = self.model.data.HistWorldPopChange, 
-                    WorldPopChange = self.model.data.WorldPopChange, 
-                    population = self.regions.population, 
-                    admin_keys = self.regions.ids, 
-                    year = self.model.current_time.year)

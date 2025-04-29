@@ -2,51 +2,61 @@ general:
   export_agents: false
   export_matrix: false
   export_move_dictionary: false
+  export_agent_tiffs: false
   flood:
     spin_up_flood: true
     random_flood: true
-    year: 2016
-    rt: 100
-    flood_protection_standard: 10
-  include_migration: true
-  include_adaptation: true
+    user_floods: 0 # {2016: 100, 2065: 20} # pass in {year: rt,} for user floods (to use set random flood to false)
   include_ambient_pop_change: true
+  include_economic_growth: true
+  convert_to_USD_ppp: true
   dynamic_behavior: true
 
+agent_behavior:
+  include_migration: true
+  include_adaptation: true
+  include_insurance: false
+
 shoreline_change:
-  include_erosion: true # set to false to exclude erosion from analysis (erosion rate remains static over time)
-  max_sandy_beach_value: 0 # set to zero for no added value of sandy beach
+  include_erosion: false # set to false to exclude erosion from analysis (erosion rate remains static over time)
+  initial_beach_width: 100
 
 flood_risk_calculations:
-  flood_protection_standard: 10
-  property_value: 77_563
+  flood_protection_standard: FLOPROS # choose 2, 10, 25, 50, 100, 250, 500, 1000 or FLOPROS
   risk_perception:
     base: 1.6
-    min: 0.01 #0.01
+    min: 0.01
     max: 2
     coef: -3.6
 
 adaptation:
+  government_strategy: maintain_fps # choose maintain_fps, reactive_government, proactive_government, no_government, no_adaptation
   mean_median_inc_ratio: 1.15
   expenditure_cap: 0.06
   loan_duration: 16
   interest_rate: 0.04
-  adaptation_cost: 10_800
   lifespan_dryproof: 75
 
+subsidies:
+  migration: false
+  adaptation: false
+
 decisions:
-  regions_included_in_migr: 122 #122
+  error_interval: 0.0 #fraction over/underestimation of SEU
   risk_aversion: 1
   decision_horizon: 15
   time_discounting: 0.032
   migration:
-    cells_to_assess: 20
-    intention_to_behavior: .12 # in fractions
-    max_cost: 500_000 # * 0.5 is min cost at dist=0 # set at 500_000 in orig paper
+    limit_admin_growth: true
+    max_admin_growth: 0.1
+    account_for_coastal_amenity_in_allocation: true
+    nr_cells_to_assess: 5 #20
+    intention_to_behavior: 0.12 # in fractions
     cost_shape: 0.05
-    amenity_weight: 0.5
+    amenity_weight: 1
 
 gravity_model:
+  run_with_gravity_model: true
   inlcude_location_effects: false
   annual_international_migration: 0
 
